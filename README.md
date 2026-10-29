@@ -58,7 +58,7 @@ This script completely sets up the user environment for quick scan-to-SMB:
 
 - Creates a dedicated scan user account or, after confirmation, updates an existing non-administrator account (hidden from login screen)
 - Creates the scan folder at **C:\scans** (configurable)
-- Sets folder permissions for the scan user, current admin, and Everyone
+- Sets restricted advanced folder permissions for the scan account, with Full Control for the receiving Windows user, local Administrators, and SYSTEM
 - Shares the folder via SMB as **scans** (configurable)
 - Creates a desktop shortcut to the scan folder
 - Sets the network category to Private (non-domain PCs)
@@ -96,6 +96,30 @@ When finished, copy the password and click Done.
 ### Existing account safety
 
 Before changing the password of an existing local account, Scans explains the impact and asks for confirmation. Declining cancels setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
+
+### Folder access review (unreleased)
+
+The following describes development code on `main`, not a promise that the current stable release includes it. No new release is published by pushing these changes.
+
+When **Set folder permissions** is selected, a separate review asks which Windows user should receive scans. It defaults to the user of the desktop session hosting Scans, including an RDP session, not the elevated administrator token. If these identities differ, the dialog explains that **Apply permissions** confirms the receiving user. You can edit the recipient; if no desktop user is detected, you must enter one. The recipient cannot be the scan account.
+
+For a **new folder**, inheritance is disabled and the following Allow rules apply to the folder, subfolders, and files:
+
+| Principal | NTFS rights |
+| --- | --- |
+| Local scan account | List folder / read data; Create files / write data; Create folders / append data |
+| Receiving Windows user | Full Control |
+| Local Administrators and SYSTEM | Full Control |
+
+Windows adds `Synchronize` to the scan account's Allow rule. The scan profile does not explicitly grant delete, execute, permission changes, or ownership. Read data can expose existing scans, and write data can allow overwriting them; this is not a write-only drop box or a universal printer-compatibility guarantee.
+
+Neither Everyone nor Domain Users is added by default. **Also grant Everyone Modify** is an explicit, unchecked option for broader NTFS access; it allows other users to read, change, and delete scans. SMB share permissions are separate.
+
+For an **existing folder**, review the displayed ACL. Scans preserves inheritance, custom rules, and protected child ACLs. Explicit Everyone/Domain Users Modify rules and scan-account Full Control rules matching the old utility's exact shape appear as individually selectable cleanup candidates, all unchecked. Old versions did not record rule ownership, so no matching rule is assumed to belong to Scans. Only entries you select are removed; inherited and unrelated entries remain. Retained grants or group memberships can give the scan account more effective access than the new profile. Review **Effective Access** in Windows rather than treating the folder as hardened.
+
+Canceling the review or failing folder setup skips SMB share configuration and reports an error; independent selected steps can still run. Cancellation happens before creating the folder or writing its ACL, but earlier account changes are not rolled back. If folder creation succeeds and the ACL write fails, the error warns that the folder retains inherited permissions.
+
+Test a real scan before relying on the destination. Some printers require additional attributes, rename, or delete access; do not broaden permissions silently to make a test pass.
 
 ### Password policy errors
 
