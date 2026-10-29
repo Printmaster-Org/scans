@@ -94,6 +94,27 @@ function Test-ScanUacCanceled {
 	return $false
 }
 
+function Start-ScanElevatedProcess {
+	param([string]$FilePath, [string]$EncodedCommand)
+	# Start-Process discards the Win32Exception (including ERROR_CANCELLED).
+	# Use the process API so cancellation remains distinguishable from launch failures.
+	$process = New-Object System.Diagnostics.Process
+	try {
+		$process.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+		$process.StartInfo.FileName = $FilePath
+		$process.StartInfo.Arguments = "-NoProfile -STA -EncodedCommand $EncodedCommand"
+		$process.StartInfo.UseShellExecute = $true
+		$process.StartInfo.Verb = 'runas'
+		[void]$process.Start()
+		# Keep the verified temporary file until the elevated utility has closed.
+		$process.WaitForExit()
+		return $process.ExitCode
+	}
+	finally {
+		$process.Dispose()
+	}
+}
+
 function Start-ScanScript {
 	<#
 	.SYNOPSIS
@@ -114,9 +135,7 @@ function Start-ScanScript {
 		Write-Host "Requesting administrator approval to run PrintMaster Scans $ReleaseVersion (SHA-256 verified)."
 		$encoded = New-ScanLaunchCommand -Path $Path -Sha256 $Sha256 -Elevated
 		try {
-			# -Wait keeps the verified temp file in place until the elevated child exits.
-			$process = Start-Process -FilePath $hostExecutable -ArgumentList @('-NoProfile', '-STA', '-EncodedCommand', $encoded) `
-				-Verb RunAs -Wait -PassThru -ErrorAction Stop
+			$exitCode = Start-ScanElevatedProcess -FilePath $hostExecutable -EncodedCommand $encoded
 		}
 		catch {
 			if (Test-ScanUacCanceled $_.Exception) {
@@ -125,7 +144,6 @@ function Start-ScanScript {
 			}
 			throw
 		}
-		$exitCode = $process.ExitCode
 	}
 
 	if ($exitCode -eq (Get-ScanVerifyFailedExitCode)) {

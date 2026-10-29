@@ -31,7 +31,7 @@ The utility is maintained at **printmaster-org/scans**. The root script and the 
 irm https://raw.githubusercontent.com/printmaster-org/scans/main/scans.ps1 | iex
 ```
 
-The new loader selects the promoted stable release from the site's manifest, downloads its version-specific GitHub asset, checks SHA-256, and only then executes it. From a normal (non-administrator) PowerShell window it then requests administrator approval through UAC; from an elevated window it runs directly. The approved process re-hashes the same bytes it executes, so a temporary file swapped after verification is refused. Declining UAC cancels without changes, and the loader waits for setup to finish before deleting the temporary file. Pinned older versions are launched the same way. A version can be selected explicitly:
+The new loader selects the promoted stable release from the site's manifest, downloads its version-specific GitHub asset, checks SHA-256, and only then executes it. From a normal (non-administrator) PowerShell window it then requests administrator approval through UAC; from an elevated window it runs directly. The approved process re-hashes the same bytes it executes, so a temporary file swapped after verification is refused. Declining UAC cancels without changes: the loader reports **Administrator approval was declined. Scans did not run and nothing was changed.** and returns to the prompt, rather than reporting a startup error. The loader waits for setup to finish before deleting the temporary file. Pinned older versions are launched the same way. A version can be selected explicitly:
 
 ```powershell
 & ([scriptblock]::Create((irm https://scans.printmaster.work/scans.ps1))) -Version 'v2.1.0'

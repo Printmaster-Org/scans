@@ -151,6 +151,19 @@ Describe 'Loader elevation' {
 			(Get-FileHash -LiteralPath $script:payload -Algorithm SHA256).Hash
 		}
 		$script:hostExe = Join-Path $PSHOME $(if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' })
+		$script:processStarted = $false
+		$script:processWaited = $false
+		$script:processDisposed = $false
+		$script:processStartError = $null
+		$script:elevatedProcess = [pscustomobject]@{ StartInfo = $null; ExitCode = 0 }
+		$script:elevatedProcess | Add-Member ScriptMethod Start {
+			$script:processStarted = $true
+			if ($script:processStartError) { throw $script:processStartError }
+			return $true
+		}
+		$script:elevatedProcess | Add-Member ScriptMethod WaitForExit { $script:processWaited = $true }
+		$script:elevatedProcess | Add-Member ScriptMethod Dispose { $script:processDisposed = $true }
+		Mock New-Object { $script:elevatedProcess } -ParameterFilter { $TypeName -eq 'System.Diagnostics.Process' }
 		Mock Write-Host { }
 	}
 
@@ -183,33 +196,62 @@ Describe 'Loader elevation' {
 
 	It 'requests UAC with a waiting, re-verifying elevated child when not elevated' {
 		Mock Test-ScanAdministrator { $false }
-		Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
 		Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' | Should Be $true
-		Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It -ParameterFilter {
-			$command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))
-			$Verb -eq 'RunAs' -and $Wait -and $PassThru -and $ArgumentList -contains '-EncodedCommand' -and
-				$command.Contains("'C:\temp\scans.ps1'") -and $command.Contains('a' * 64) -and $command.Contains(' -Elevated')
-		}
+		$info = $script:elevatedProcess.StartInfo
+		$info.FileName | Should Be $script:hostExe
+		$info.UseShellExecute | Should Be $true
+		$info.Verb | Should Be 'runas'
+		$info.Arguments | Should Match '^-NoProfile -STA -EncodedCommand '
+		$command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($info.Arguments -split ' ')[-1]))
+		$command.Contains("'C:\temp\scans.ps1'") | Should Be $true
+		$command.Contains('a' * 64) | Should Be $true
+		$command.Contains(' -Elevated') | Should Be $true
+		$script:processStarted | Should Be $true
+		$script:processWaited | Should Be $true
+		$script:processDisposed | Should Be $true
 	}
 
 	It 'treats a declined UAC prompt as a normal cancellation' {
 		Mock Test-ScanAdministrator { $false }
-		Mock Start-Process { throw [InvalidOperationException]::new('canceled', [ComponentModel.Win32Exception]::new(1223)) }
+		$script:processStartError = [ComponentModel.Win32Exception]::new(1223, 'Localized cancellation text')
 		Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' | Should Be $false
+		Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'declined' }
+		$script:processWaited | Should Be $false
+		$script:processDisposed | Should Be $true
+		Test-Path -LiteralPath $script:marker | Should Be $false
+	}
+
+	It 'cleans up the download after cancellation through the real launch and cleanup functions' {
+		Mock Test-ScanAdministrator { $false }
+		$script:processStartError = [ComponentModel.Win32Exception]::new(1223)
+		$script:release = New-TestRelease
+		$script:release.sha256 = & $script:writePayload 0
+		Mock Invoke-RestMethod { [pscustomobject]@{ schemaVersion = 1; stable = 'v2.1.0'; releases = @($script:release) } }
+		Mock Invoke-WebRequest {
+			$script:canceledDownload = $OutFile
+			Copy-Item -LiteralPath $script:payload -Destination $OutFile
+		}
+		{ Invoke-ScanRelease } | Should Not Throw
+		Test-Path -LiteralPath (Split-Path $script:canceledDownload -Parent) | Should Be $false
+		Test-Path -LiteralPath $script:marker | Should Be $false
 		Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'declined' }
 	}
 
 	It 'rethrows other elevation failures' {
 		Mock Test-ScanAdministrator { $false }
-		Mock Start-Process { throw [ComponentModel.Win32Exception]::new(2) }
-		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw
+		foreach ($code in @(2, 5)) {
+			$script:processStartError = [ComponentModel.Win32Exception]::new($code)
+			{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw
+		}
+		$script:processDisposed | Should Be $true
+		Assert-MockCalled Write-Host -Times 0 -Exactly -Scope It -ParameterFilter { "$Object" -match 'declined' }
 	}
 
 	It 'reports elevated child failures and post-verification tampering distinctly' {
 		Mock Test-ScanAdministrator { $false }
-		Mock Start-Process { [pscustomobject]@{ ExitCode = 1 } }
+		$script:elevatedProcess.ExitCode = 1
 		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw 'exited with code 1'
-		Mock Start-Process { [pscustomobject]@{ ExitCode = (Get-ScanVerifyFailedExitCode) } }
+		$script:elevatedProcess.ExitCode = Get-ScanVerifyFailedExitCode
 		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw 'changed after verification'
 	}
 
@@ -220,6 +262,7 @@ Describe 'Loader elevation' {
 		Start-ScanScript -Path $script:payload -Sha256 $hash -ReleaseVersion 'v2.3.0' | Should Be $true
 		Get-Content -LiteralPath $script:marker | Should Be 'ran elevated=False'
 		Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
+		Assert-MockCalled New-Object -Times 0 -Exactly -Scope It -ParameterFilter { $TypeName -eq 'System.Diagnostics.Process' }
 	}
 }
 
