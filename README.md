@@ -62,8 +62,8 @@ This script completely sets up the user environment for quick scan-to-SMB:
 - Shares the folder via SMB as **scans** (configurable)
 - Creates a desktop shortcut to the scan folder
 - Sets the network category to Private (non-domain PCs)
-- Enables File and Printer Sharing firewall rules
-- Enables Network Discovery firewall rules
+- Enables File and Printer Sharing firewall rules (all that SMB scan-to-folder needs)
+- Optionally enables Network Discovery firewall rules. This is off by default because it's only useful for printers that browse the network for the PC instead of using a typed `\\PC\share` path. Scans never disables a Network Discovery rule that is already on. Versions up to v2.2.0 always enabled it.
 
 All settings are configurable through the UI before execution.
 
