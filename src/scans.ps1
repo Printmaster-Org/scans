@@ -266,6 +266,57 @@ function New-RandomPassword {
 	return $result
 }
 
+function Test-ScanUserAdministrator {
+	param(
+		[string]$Username,
+		$User
+	)
+
+	if (-not (Get-Command -Name 'Get-LocalGroupMember' -ErrorAction SilentlyContinue)) {
+		throw "Cannot verify whether existing account '$Username' belongs to the local Administrators group. Choose another username or use a Windows version with local account cmdlets."
+	}
+
+	$administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+	$members = @(Get-LocalGroupMember -SID $administratorsSid -ErrorAction Stop)
+	foreach ($member in $members) {
+		if ($User -and $User.SID -and $member.SID -and $member.SID.Value -eq $User.SID.Value) {
+			return $true
+		}
+
+		# Legacy account lookup does not return a SID; compare the local account name instead.
+		$memberName = ($member.Name -split '\\')[-1]
+		if ($memberName -and $memberName -ieq $Username) {
+			return $true
+		}
+	}
+
+	return $false
+}
+
+function Confirm-ExistingScanAccountUpdate {
+	param([string]$Username)
+
+	$message = "A local account named '$Username' already exists. Continuing will change its password and may affect anything that uses it. Continue only if this is the account you intend to use for scanning."
+	Write-Verbose "Requesting confirmation before changing the password for existing account '$Username'."
+	if ($script:progressWindow) {
+		return [System.Windows.MessageBox]::Show(
+			$script:progressWindow,
+			$message,
+			'Existing Account Password Change',
+			[System.Windows.MessageBoxButton]::YesNo,
+			[System.Windows.MessageBoxImage]::Warning,
+			[System.Windows.MessageBoxResult]::No
+		) -eq [System.Windows.MessageBoxResult]::Yes
+	}
+	return [System.Windows.MessageBox]::Show(
+		$message,
+		'Existing Account Password Change',
+		[System.Windows.MessageBoxButton]::YesNo,
+		[System.Windows.MessageBoxImage]::Warning,
+		[System.Windows.MessageBoxResult]::No
+	) -eq [System.Windows.MessageBoxResult]::Yes
+}
+
 function Initialize-ScanUser {
 	param(
 		[string]$Username,
@@ -276,9 +327,51 @@ function Initialize-ScanUser {
 	)
 	$results = @()
 	try {
+		$existingUser = $null
+		if ($script:hasLocalAccounts) {
+			try {
+				$existingUser = Get-LocalUser -Name $Username -ErrorAction Stop
+			}
+			catch {
+				if ($_.FullyQualifiedErrorId -match 'UserNotFound') {
+					$existingUser = $null
+				}
+				else {
+					throw
+				}
+			}
+		}
+		else {
+			# Sanitize inputs for external commands to prevent injection.
+			$safeUser = $Username -replace '[^a-zA-Z0-9_\-]', ''
+			$safePass = $Password -replace '"', ''
+			net user $safeUser 2>&1 | Out-Null
+			$existingUser = $LASTEXITCODE -eq 0
+		}
+
+		if ($existingUser) {
+			if (Test-ScanUserAdministrator -Username $Username -User $existingUser) {
+				$warning = "Refusing to change the password for '$Username' because it belongs to the local Administrators group."
+				Write-Warning $warning
+				$exception = New-Object System.InvalidOperationException("$warning Choose a different username or cancel setup.")
+				$errorRecord = New-Object System.Management.Automation.ErrorRecord($exception, 'ProtectedAccount', [System.Management.Automation.ErrorCategory]::PermissionDenied, $Username)
+				throw $errorRecord
+			}
+			if (-not (Confirm-ExistingScanAccountUpdate -Username $Username)) {
+				Write-Verbose "Setup canceled because confirmation to change existing account '$Username' was declined."
+				return @(@{
+					Status = 'Skipped'
+					Message = "Canceled before changing existing account '$Username'; no account changes were made."
+					Error = $null
+					AccountSetupFailed = $true
+					SetupCanceled = $true
+				})
+			}
+		}
+
 		if ($script:hasLocalAccounts) {
 			$securePass = $Password | ConvertTo-SecureString -AsPlainText -Force
-			if (![boolean](Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+			if (-not $existingUser) {
 				New-LocalUser -Name $Username -Password $securePass -Description $Description -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -FullName "scans" -ErrorAction Stop | Out-Null
 				$results += @{ Status = 'Success'; Message = "Created new user '$Username'"; Error = $null }
 			}
@@ -288,13 +381,8 @@ function Initialize-ScanUser {
 			}
 		}
 		else {
-			# Sanitize inputs for external commands to prevent injection
-			$safeUser = $Username -replace '[^a-zA-Z0-9_\-]', ''
-			$safePass = $Password -replace '"', ''
 			$safeDesc = $Description -replace '"', ''
-			$existingUser = net user $safeUser 2>&1
-			$userExists = $LASTEXITCODE -eq 0
-			if (-not $userExists) {
+			if (-not $existingUser) {
 				$userOutput = net user $safeUser $safePass /add /fullname:"scans" /comment:"$safeDesc" /active:yes /expires:never /passwordchg:no 2>&1
 			}
 			else {
@@ -312,7 +400,7 @@ function Initialize-ScanUser {
 				$errorRecord = New-Object System.Management.Automation.ErrorRecord($exception, $errorId, [System.Management.Automation.ErrorCategory]::InvalidOperation, $Username)
 				throw $errorRecord
 			}
-			if (-not $userExists) {
+			if (-not $existingUser) {
 				# Set password to never expire via wmic
 				wmic useraccount where "Name='$safeUser'" set PasswordExpires=FALSE 2>&1 | Out-Null
 				$results += @{ Status = 'Success'; Message = "Created new user '$Username' (net user)"; Error = $null }
@@ -805,6 +893,7 @@ $script:hasErrors = $false
 function Get-ErrorRemediation([string]$errorText) {
 	switch -Regex ($errorText) {
 		'InvalidPassword|password.*(policy|requirements)|\b2245\b' { return $script:Remediation.PasswordPolicy }
+		'ProtectedAccount|AccountMembershipCheckFailed' { return "Choose a different username. Scans will not change an account in the local Administrators group or when its membership cannot be safely verified." }
 		'trust relationship'        { return $script:Remediation.TrustRelation }
 		'Access is denied|access denied|UnauthorizedAccess' { return $script:Remediation.AccessDenied }
 		'share.*in use|being used'  { return $script:Remediation.ShareInUse }
@@ -902,9 +991,16 @@ $domainJoined = $computerDetails.PartOfDomain
 # Create/update scans user account and hide from login screen
 $scanUserConfigured = $true
 $setupCancelled = $false
+$setupCancelReason = 'password rejection'
 if ($createUser -or $hideUser) {
 	do {
 		$userResults = @(Initialize-ScanUser -Username $scanUser -Password $scanPass -Description $description -HideFromLogin $hideUser -DomainJoined $domainJoined)
+		$accountCancellation = $userResults | Where-Object { $_.SetupCanceled } | Select-Object -First 1
+		if ($accountCancellation) {
+			$setupCancelled = $true
+			$setupCancelReason = 'existing account confirmation was declined'
+			break
+		}
 		$passwordFailure = $userResults | Where-Object { $_.AccountSetupFailed -and ($_.ErrorId -match 'InvalidPassword' -or $_.Error -match '\b2245\b') } | Select-Object -First 1
 		if ($passwordFailure) {
 			$newPassword = Show-PasswordRetryDialog -ErrorText $passwordFailure.Error
@@ -922,7 +1018,8 @@ if ($createUser -or $hideUser) {
 }
 
 if ($setupCancelled) {
-	Set-ProgressBar 'Setup canceled after password rejection; remaining steps were not run.' 0
+	if ($accountCancellation) { Show-StepResult $accountCancellation }
+	Set-ProgressBar "Setup canceled because $setupCancelReason; remaining steps were not run." 0
 	$script:progressWindow.Title = 'PrintMaster Scans Setup - Canceled'
 }
 else {

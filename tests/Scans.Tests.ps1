@@ -23,6 +23,11 @@ function Get-LocalUser {
 	param([string]$Name)
 	throw 'Unmocked Get-LocalUser'
 }
+function Get-LocalGroupMember {
+	[CmdletBinding()]
+	param($SID)
+	throw 'Unmocked Get-LocalGroupMember'
+}
 function New-LocalUser {
 	[CmdletBinding()]
 	param([string]$Name, [securestring]$Password, [string]$Description, [switch]$AccountNeverExpires,
@@ -82,8 +87,10 @@ Describe 'Scan account password errors' {
 	BeforeEach {
 		$script:hasLocalAccounts = $true
 		Mock Get-LocalUser { $null }
+		Mock Get-LocalGroupMember { @() }
 		Mock New-LocalUser { }
 		Mock Set-LocalUser { }
+		Mock Confirm-ExistingScanAccountUpdate { $true }
 		Mock Get-ItemProperty { throw 'Account hiding must not run after account setup fails' }
 	}
 
@@ -113,6 +120,45 @@ Describe 'Scan account password errors' {
 		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled Set-LocalUser -Times 1 -Exactly -Scope It
+	}
+
+	It 'requires confirmation before changing an existing account password' {
+		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
+		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result[0].Status | Should Be 'Success'
+		Assert-MockCalled Confirm-ExistingScanAccountUpdate -Times 1 -Exactly -Scope It -ParameterFilter { $Username -eq 'scans' }
+		Assert-MockCalled Set-LocalUser -Times 1 -Exactly -Scope It
+	}
+
+	It 'cancels before changing an existing account when confirmation is declined' {
+		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
+		Mock Confirm-ExistingScanAccountUpdate { $false }
+		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!' -HideFromLogin $true)
+		$result[0].SetupCanceled | Should Be $true
+		$result[0].Message | Should Match 'no account changes were made'
+		Assert-MockCalled Set-LocalUser -Times 0 -Exactly -Scope It
+		Assert-MockCalled Get-ItemProperty -Times 0 -Exactly -Scope It
+	}
+
+	It 'refuses to change an existing local Administrators account' {
+		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
+		Mock Get-LocalGroupMember { @([pscustomobject]@{ Name = 'COMPUTER\scans' }) }
+		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result[0].Status | Should Be 'Failed'
+		$result[0].ErrorId | Should Match 'ProtectedAccount'
+		$result[0].Error | Should Match 'local Administrators group'
+		Assert-MockCalled Confirm-ExistingScanAccountUpdate -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-LocalUser -Times 0 -Exactly -Scope It
+	}
+
+	It 'fails closed when administrator membership cannot be checked' {
+		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
+		Mock Get-LocalGroupMember { throw 'Membership lookup failed' }
+		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result[0].Status | Should Be 'Failed'
+		$result[0].Error | Should Match 'Membership lookup failed'
+		Assert-MockCalled Confirm-ExistingScanAccountUpdate -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-LocalUser -Times 0 -Exactly -Scope It
 	}
 
 	It 'passes the production description within the 48-character account limit on creation and update' {
@@ -420,7 +466,9 @@ Describe 'Account visibility' {
 	BeforeEach {
 		$script:hasLocalAccounts = $true
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
+		Mock Get-LocalGroupMember { @() }
 		Mock Set-LocalUser { }
+		Mock Confirm-ExistingScanAccountUpdate { $true }
 		Mock Get-ItemProperty { $null }
 		Mock Test-Path { $false }
 		Mock New-Item { }
