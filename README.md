@@ -56,7 +56,7 @@ Windows 7/8/8.1 and Windows Server are not validated support targets. Windows 10
 
 This script completely sets up the user environment for quick scan-to-SMB:
 
-- Creates or updates a dedicated scan user account (hidden from login screen)
+- Creates a dedicated scan user account or, after confirmation, updates an existing non-administrator account (hidden from login screen)
 - Creates the scan folder at **C:\scans** (configurable)
 - Sets folder permissions for the scan user, current admin, and Everyone
 - Shares the folder via SMB as **scans** (configurable)
@@ -92,6 +92,10 @@ Wait for the utility to complete all changes.
 When finished, copy the password and click Done.
 
 ![Finished](img/scans-finished.png)
+
+### Existing account safety
+
+Before changing the password of an existing local account, Scans explains the impact and asks for confirmation. Declining cancels setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
 
 ### Password policy errors
 
