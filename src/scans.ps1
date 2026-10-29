@@ -1,10 +1,11 @@
 param([switch]$Elevated)
 
-# Setup variables and defaults
-[string]$scanUser = 'scans'
-[string]$folderPath = 'C:\scans'
-[string]$shareName = 'scans'
-[string]$description = 'Scanning provided by PrintMaster'
+# The loader invokes this utility in a child scriptblock; match the script scope
+# used by the wizard so defaults survive both loader and direct-file launches.
+[string]$script:scanUser = 'scans'
+[string]$script:folderPath = 'C:\scans'
+[string]$script:shareName = 'scans'
+[string]$script:description = 'Scanning provided by PrintMaster'
 
 # Load the .NET Framework classes
 Add-Type -AssemblyName System.Windows.Forms
@@ -431,15 +432,15 @@ if ($PSVersionTable.PSVersion -lt [version]'5.1') {
 		-Remediation $script:Remediation.OldPowerShell
 }
 
-$createUser = $true
-$hideUser = $true
-$createFolder = $true
-$setPermissions = $true
-$setShare = $true
-$createShortcut = $true
-$checkNetworkSettings = $true
+$script:createUser = $true
+$script:hideUser = $true
+$script:createFolder = $true
+$script:setPermissions = $true
+$script:setShare = $true
+$script:createShortcut = $true
+$script:checkNetworkSettings = $true
 # Network Discovery is not needed for SMB scan-to-folder; enable only on request.
-$enableNetworkDiscovery = $false
+$script:enableNetworkDiscovery = $false
 
 function Get-ScanPassphraseWordList {
 	# EFF Short Wordlist 1 (https://www.eff.org/dice), licensed CC BY 3.0 US

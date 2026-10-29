@@ -73,6 +73,8 @@ Since v3.0.0, Scans is a four-page wizard: **Configure → Review → Apply → 
 
 ### 1. Configure
 
+The account defaults to `scans`, the folder to `C:\scans`, and the share name to `scans`. v3.0.1 restores these defaults and the default step selections when launched through the release loader; v3.0.0 incorrectly left them empty or off.
+
 Choose the scan account, password, scans folder, and share name. The password is a generated passphrase, hidden by default; **Show** reveals it and **Generate** creates a new one. The share name shows the network path printers will use.
 
 ![Configure page](img/scans-setup.png)

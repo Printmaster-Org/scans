@@ -188,7 +188,7 @@ Describe 'Scan account password errors' {
 		$assignment = $ast.Find({
 			param($node)
 			$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-			($node.Left.Extent.Text -replace '^\[string\]', '') -eq '$description'
+			($node.Left.Extent.Text -replace '^\[string\]', '') -eq '$script:description'
 		}, $true)
 		. ([scriptblock]::Create($assignment.Extent.Text))
 		$description | Should Not BeNullOrEmpty
@@ -1743,6 +1743,48 @@ Describe 'Setup wizard window' {
 		(Get-Control 'configPasswordBox').Password | Should Be 'Alpha-Bravo7-Charlie-Delta'
 		(Get-Control 'txtSharePreview').Text | Should Match '\\scans$'
 		Get-Control 'btnSettings' | Should BeNullOrEmpty
+	}
+
+	It 'prefills names and selects the default steps when launched in the loader child scope' {
+		$defaultNames = @('scanUser', 'folderPath', 'shareName', 'description',
+			'createUser', 'hideUser', 'createFolder', 'setPermissions', 'setShare',
+			'createShortcut', 'checkNetworkSettings', 'enableNetworkDiscovery')
+		$assignments = @($ast.EndBlock.Statements | Where-Object {
+			$_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+			($_.Left.Extent.Text -replace '^\[string\]', '' -replace '^\$(script:)?', '') -in $defaultNames
+		})
+		$assignments.Count | Should Be $defaultNames.Count
+		$factory = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+			$node.Name -eq 'New-ScanSetupConfiguration'
+		}, $true)
+		# A fresh runspace prevents the fixture's script-scoped defaults from hiding
+		# the scope mismatch when the loader invokes the utility with &.
+		$launch = '& {' + ($assignments.Extent.Text -join "`n") + "`n" +
+			$factory.Extent.Text + "`nNew-ScanSetupConfiguration`n}"
+		$hostShell = [powershell]::Create()
+		try {
+			$configuration = @($hostShell.AddScript($launch).Invoke())
+			$hostShell.HadErrors | Should Be $false
+			$configuration.Count | Should Be 1
+			$configuration = $configuration[0]
+		}
+		finally { $hostShell.Dispose() }
+		$configuration.Username | Should Be 'scans'
+		$configuration.FolderPath | Should Be 'C:\scans'
+		$configuration.ShareName | Should Be 'scans'
+		$configuration.Description | Should Be 'Scanning provided by PrintMaster'
+		foreach ($name in 'CreateUser', 'HideUser', 'CreateFolder', 'SetPermissions',
+			'SetShare', 'CreateShortcut', 'CheckNetwork') {
+			$configuration.$name | Should Be $true
+		}
+		$configuration.EnableDiscovery | Should Be $false
+		Set-ScanWizardConfiguration -Window $script:wizard -Configuration $configuration
+		(Get-Control 'txtUsername').Text | Should Be 'scans'
+		(Get-Control 'txtFolderPath').Text | Should Be 'C:\scans'
+		(Get-Control 'txtShareName').Text | Should Be 'scans'
+		(Get-Control 'txtSharePreview').Text | Should Match '\\scans$'
 	}
 
 	It 'reveals, edits, generates, and re-masks through the shared password field' {
