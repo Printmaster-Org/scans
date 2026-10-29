@@ -596,6 +596,77 @@ function Get-ScanFolderCleanupRules {
 	}
 }
 
+function Resolve-ScanPrincipalDisplay {
+	param([System.Security.Principal.SecurityIdentifier]$Sid)
+
+	try {
+		return $Sid.Translate([System.Security.Principal.NTAccount]).Value
+	}
+	catch [System.Security.Principal.IdentityNotMappedException] {
+		Write-Warning "Could not resolve account name for SID '$($Sid.Value)'. It may be deleted or unavailable; its permissions will remain unchanged unless explicitly selected for removal."
+		return "Unresolved account ($($Sid.Value))"
+	}
+}
+
+function Get-ScanFolderAccessRows {
+	param(
+		$Acl,
+		[array]$CleanupRules
+	)
+
+	$names = @{}
+	$scanRights = [System.Security.AccessControl.FileSystemRights]::ListDirectory -bor
+		[System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+		[System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+		[System.Security.AccessControl.FileSystemRights]::Synchronize
+	$modifyRights = [System.Security.AccessControl.FileSystemRights]::Modify -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
+	foreach ($rule in $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+		$sid = $rule.IdentityReference.Value
+		if (-not $names.ContainsKey($sid)) {
+			$names[$sid] = Resolve-ScanPrincipalDisplay $rule.IdentityReference
+		}
+		$access = switch ($rule.FileSystemRights) {
+			([System.Security.AccessControl.FileSystemRights]::FullControl) { 'Full control'; break }
+			$modifyRights { 'Modify'; break }
+			$scanRights { 'Scan: read, write, append'; break }
+			default { "Special: $($rule.FileSystemRights)" }
+		}
+		$targets = @()
+		if (-not ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly)) { $targets += 'This folder' }
+		if ($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) { $targets += 'subfolders' }
+		if ($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) { $targets += 'files' }
+		$scope = $targets -join ', '
+		if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::NoPropagateInherit) { $scope += ' (one level)' }
+		$canRemove = $false
+		foreach ($candidate in $CleanupRules) {
+			# Match the entire ACE, not its display name: several entries can refer
+			# to the same account with different scope, rights, or inheritance.
+			if (-not $rule.IsInherited -and
+				$candidate.IdentityReference.Value -eq $sid -and
+				$candidate.AccessControlType -eq $rule.AccessControlType -and
+				$candidate.FileSystemRights -eq $rule.FileSystemRights -and
+				$candidate.InheritanceFlags -eq $rule.InheritanceFlags -and
+				$candidate.PropagationFlags -eq $rule.PropagationFlags) {
+				$canRemove = $true
+				break
+			}
+		}
+		[pscustomobject]@{
+			Principal = $names[$sid]
+			Access = $access
+			Type = $rule.AccessControlType.ToString()
+			Source = $(if ($rule.IsInherited) { 'Inherited' } else { 'Explicit' })
+			Scope = $scope
+			Icon = $(if ($rule.AccessControlType -eq 'Deny') { [char]0xE711 } else { [char]0xE73E })
+			Color = $(if ($rule.AccessControlType -eq 'Deny') { '#cb4b16' } else { $script:thAccentHi })
+			Details = "SID: $sid`nRights: $($rule.FileSystemRights)`nApplies to: $scope`nPropagation: $($rule.PropagationFlags)`nRemoval: $(if ($canRemove) { 'Optional reviewed cleanup' } else { 'Preserved' })"
+			CanRemove = $canRemove
+			Remove = $false
+			Rule = $rule
+		}
+	}
+}
+
 function Show-ScanFolderAccessDialog {
 	param(
 		[string]$FolderPath,
@@ -605,60 +676,172 @@ function Show-ScanFolderAccessDialog {
 		[array]$CleanupRules
 	)
 
-	$folderAccessContent = @'
+	$warningColor = if ($script:useDarkTheme) { '#d7af35' } else { '#875f00' }
+	$dangerColor = if ($script:useDarkTheme) { '#ef9865' } else { '#a52a00' }
+	$folderAccessContent = @"
         <StackPanel>
-            <TextBlock Name="txtFolder" TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <TextBlock Text="Scan account: list/read data, create/write files, create folders/append data. No explicit delete, execute, permission-change, or ownership grant. Windows also adds Synchronize." TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <TextBlock Name="txtIdentity" TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <TextBlock Text="Receiving Windows user (PC\user or DOMAIN\user):" Margin="0,0,0,4"/>
-            <TextBox Name="txtRecipient" Margin="0,0,0,8"/>
-            <TextBlock Text="This user, local Administrators, and SYSTEM receive Full Control. The receiving user must differ from the scan account." TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <CheckBox Name="chkEveryone" Content="Also grant Everyone Modify (not recommended)" Margin="0,0,0,4"/>
-            <TextBlock Text="Optional broader access lets other users read, change, and delete scans at the NTFS layer. SMB share access is separate." TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <TextBlock Name="txtPolicy" TextWrapping="Wrap" Margin="0,0,0,8"/>
-            <TextBox Name="txtExistingRules" IsReadOnly="True" TextWrapping="Wrap" Height="140"
-                     VerticalScrollBarVisibility="Auto" Visibility="Collapsed" Margin="0,0,0,8"/>
-            <StackPanel Name="pnlCleanup"/>
-            <TextBlock Text="Read data can expose existing scans; write data can overwrite files. Some printers need extra rights; test your printer before using this destination." TextWrapping="Wrap" Margin="0,8,0,12"/>
+            <StackPanel.Resources>
+                <Style x:Key="SectionTitle" TargetType="TextBlock" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                    <Setter Property="FontWeight" Value="SemiBold"/>
+                    <Setter Property="FontSize" Value="15"/>
+                    <Setter Property="Margin" Value="0,0,0,8"/>
+                </Style>
+                <Style TargetType="GridViewColumnHeader">
+                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                    <Setter Property="Background" Value="$($script:thBgAlt)"/>
+                    <Setter Property="Padding" Value="8,7"/>
+                    <Setter Property="HorizontalContentAlignment" Value="Left"/>
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="GridViewColumnHeader">
+                                <Border Background="{TemplateBinding Background}" BorderBrush="$($script:thBorder)" BorderThickness="0,0,0,1" Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter/>
+                                </Border>
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
+                </Style>
+                <Style TargetType="ListViewItem">
+                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                    <Setter Property="Padding" Value="0,8"/>
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                    <Style.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter Property="Background" Value="$($script:thBgAlt)"/>
+                            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                        </Trigger>
+                    </Style.Triggers>
+                </Style>
+            </StackPanel.Resources>
+            <TextBlock Text="Review folder access" FontSize="21" FontWeight="SemiBold" Foreground="$($script:thFgStrong)"/>
+            <TextBlock Name="txtFolder" TextWrapping="Wrap" FontFamily="Consolas" Margin="0,4,0,10"/>
+            <Border Background="$($script:thBgAlt)" CornerRadius="5" Padding="10" Margin="0,0,0,10">
+                <StackPanel>
+                    <TextBlock Text="1  Who receives the scans?" Style="{StaticResource SectionTitle}"/>
+                    <TextBlock Text="Receiving Windows user (PC\user or DOMAIN\user)" Margin="0,0,0,4"/>
+                    <TextBox Name="txtRecipient" AutomationProperties.Name="Receiving Windows user"/>
+                    <TextBlock Text="Full control for this user, local Administrators, and SYSTEM." Margin="0,6,0,0"/>
+                    <TextBlock Name="txtIdentity" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    <TextBlock Name="txtIdentityWarning" Foreground="$warningColor" TextWrapping="Wrap" FontWeight="SemiBold" Margin="0,6,0,0" Visibility="Collapsed"/>
+                </StackPanel>
+            </Border>
+            <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                <Border BorderBrush="$($script:thAccentHi)" BorderThickness="1" CornerRadius="5" Padding="12">
+                    <StackPanel>
+                        <TextBlock Text="2  Scan account access" Style="{StaticResource SectionTitle}"/>
+                        <TextBlock Text="Read and list scans" Foreground="$($script:thFgStrong)"/>
+                        <TextBlock Text="Create / write files and append data" Foreground="$($script:thFgStrong)" Margin="0,3,0,0"/>
+                        <TextBlock Text="No explicit delete, execute, or permission changes." TextWrapping="Wrap" Margin="0,6,0,0"/>
+                        <TextBlock Text="Can read and overwrite scans: not a write-only drop box." Foreground="$warningColor" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="2" BorderBrush="$($script:thBorder)" BorderThickness="1" CornerRadius="5" Padding="12">
+                    <StackPanel>
+                        <TextBlock Text="Folder policy" Style="{StaticResource SectionTitle}"/>
+                        <TextBlock Name="txtPolicy" TextWrapping="Wrap"/>
+                        <TextBlock Text="No Everyone or Domain Users grant by default." TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+            </Grid>
+            <Expander Header="Advanced: broader access and exact permission details" Foreground="$($script:thFgStrong)" Margin="0,0,0,10">
+                <StackPanel Margin="8,10,0,0">
+                    <CheckBox Name="chkEveryone" Content="Also grant Everyone Modify (not recommended)" Foreground="$warningColor"/>
+                    <TextBlock Text="Allows other users to read, change, and delete scans at the NTFS layer. SMB share permissions are separate." TextWrapping="Wrap" Margin="0,5,0,8"/>
+                    <TextBlock Text="Scan rights: List folder / read data; Create files / write data; Create folders / append data. Windows adds Synchronize. Applies to this folder, subfolders, and files." TextWrapping="Wrap"/>
+                    <TextBlock Text="The receiving user must differ from the scan account. No ownership right is explicitly granted to the scan profile." TextWrapping="Wrap" Margin="0,5,0,0"/>
+                </StackPanel>
+            </Expander>
+            <Border Name="pnlEveryoneWarning" BorderBrush="$dangerColor" BorderThickness="3,0,0,0" Padding="8" Visibility="Collapsed">
+                <TextBlock Text="Broad access selected: Everyone can modify and delete scans where share access also permits it." Foreground="$dangerColor" TextWrapping="Wrap" FontWeight="SemiBold"/>
+            </Border>
+            <StackPanel Name="pnlExistingAccess" Visibility="Collapsed">
+                <DockPanel Margin="0,0,0,6">
+                    <TextBlock Text="3  Existing permissions" Style="{StaticResource SectionTitle}"/>
+                    <TextBlock Name="txtRuleCount" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
+                </DockPanel>
+                <Border BorderBrush="$warningColor" BorderThickness="3,0,0,0" Background="$($script:thBgAlt)" Padding="8,6" Margin="0,0,0,6">
+                    <StackPanel>
+                        <TextBlock Text="Remove only entries you have reviewed" Foreground="$warningColor" FontWeight="SemiBold"/>
+                        <TextBlock Text="All start unchecked. A match does not prove Scans created the rule. Inherited and unselected access stays." TextWrapping="Wrap" Margin="0,3,0,0"/>
+                    </StackPanel>
+                </Border>
+                <ListView Name="lstExistingRules" Height="175" Background="$($script:thBg)" BorderBrush="$($script:thBorder)"
+                          ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          AutomationProperties.Name="Existing folder permissions">
+                    <ListView.Resources>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                        </Style>
+                    </ListView.Resources>
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem" BasedOn="{StaticResource {x:Type ListViewItem}}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                            <Setter Property="ToolTip" Value="{Binding Details}"/>
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.View>
+                        <GridView AllowsColumnReorder="False">
+                            <GridViewColumn Header="Remove" Width="65">
+                                <GridViewColumn.CellTemplate><DataTemplate>
+                                    <CheckBox IsChecked="{Binding Remove, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                              HorizontalAlignment="Center" AutomationProperties.Name="{Binding Principal}" ToolTip="Remove this reviewed explicit entry">
+                                        <CheckBox.Style>
+                                            <Style TargetType="CheckBox">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding CanRemove}" Value="False">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                        <Setter Property="IsEnabled" Value="False"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </CheckBox.Style>
+                                    </CheckBox>
+                                </DataTemplate></GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                            <GridViewColumn Header="Account" Width="220">
+                                <GridViewColumn.CellTemplate><DataTemplate>
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="{Binding Icon}" FontFamily="Segoe MDL2 Assets" Foreground="{Binding Color}" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                                        <TextBlock Text="{Binding Principal}" Foreground="$($script:thFgStrong)" TextTrimming="CharacterEllipsis" MaxWidth="185"/>
+                                    </StackPanel>
+                                </DataTemplate></GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                            <GridViewColumn Header="Type" Width="55" DisplayMemberBinding="{Binding Type}"/>
+                            <GridViewColumn Header="Access" Width="185" DisplayMemberBinding="{Binding Access}"/>
+                            <GridViewColumn Header="Source" Width="80" DisplayMemberBinding="{Binding Source}"/>
+                            <GridViewColumn Header="Applies to" Width="205" DisplayMemberBinding="{Binding Scope}"/>
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+                <TextBlock Text="Hover for SID and exact rights. Retained grants may exceed the scan profile; protected child ACLs are not reset." TextWrapping="Wrap" Margin="0,5,0,10"/>
+            </StackPanel>
         </StackPanel>
-'@
-	$window = New-ScanDialog -Title 'Folder Access' -ContentXaml $folderAccessContent -Width 680 `
+"@
+	$window = New-ScanDialog -Title 'Folder Access' -ContentXaml $folderAccessContent -Width 900 `
 		-AcceptText 'Apply permissions' -CancelText 'Cancel folder setup' -Owner $script:progressWindow
-	$window.FindName('txtFolder').Text = "Review folder access: $FolderPath"
+	$window.FindName('txtFolder').Text = $FolderPath
 	$window.FindName('txtRecipient').Text = $DesktopUser
-	$identityText = "Desktop user: $DesktopUser. Elevated account: $ElevatedUser."
+	$identityText = "Desktop: $DesktopUser  |  Running as: $ElevatedUser"
 	if ([string]::IsNullOrWhiteSpace($DesktopUser)) {
-		$identityText += ' No desktop user was detected. Enter and confirm the receiving user; no administrator fallback is selected.'
+		$window.FindName('txtIdentityWarning').Text = 'No desktop user was detected. Enter the receiving user; no administrator fallback is selected.'
 	}
 	elseif ($DesktopUser -ine $ElevatedUser) {
-		$identityText += ' These accounts differ. Applying confirms Full Control for the receiving user shown below, not automatically for the elevated account.'
+		$window.FindName('txtIdentityWarning').Text = 'These accounts differ. Apply confirms Full Control for the receiving user, not automatically for the elevated account.'
 	}
+	if ($window.FindName('txtIdentityWarning').Text) { $window.FindName('txtIdentityWarning').Visibility = 'Visible' }
 	$window.FindName('txtIdentity').Text = $identityText
-	$window.FindName('txtPolicy').Text = 'New folder: inheritance will be disabled, with only the listed grants (plus Everyone only if selected).'
-	$cleanupBoxes = @()
+	$window.FindName('txtPolicy').Text = 'New folder: inheritance will be disabled. Only the reviewed grants are added.'
+	$accessRows = @()
 	if ($Acl) {
-		$window.FindName('txtPolicy').Text = 'Existing folder: inheritance and custom permissions are preserved. Existing access may exceed the scan profile. Only checked explicit rules below will be removed; matching a legacy Scans rule does not prove Scans created it. Review before applying.'
-		$window.FindName('txtExistingRules').Visibility = 'Visible'
-		$window.FindName('txtExistingRules').Text = ($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
-			"$($_.IdentityReference): $($_.AccessControlType) $($_.FileSystemRights); inherited=$($_.IsInherited); applies=$($_.InheritanceFlags); propagation=$($_.PropagationFlags)"
-		}) -join "`r`n"
-		foreach ($rule in $CleanupRules) {
-			$box = [System.Windows.Controls.CheckBox]::new()
-			$principal = if ($rule.IdentityReference.Value -eq 'S-1-1-0') { 'Everyone' }
-				elseif ($rule.IdentityReference.Value -match '-513$') { 'Domain Users' }
-				else { 'Scan account' }
-			$label = [System.Windows.Controls.TextBlock]::new()
-			$label.Text = "Remove explicit $principal [$($rule.IdentityReference)]: $($rule.FileSystemRights)"
-			$label.TextWrapping = 'Wrap'
-			$label.MaxWidth = 540
-			$box.Content = $label
-			$box.IsChecked = $false
-			$box.Tag = $rule
-			$box.Margin = '0,0,0,6'
-			$window.FindName('pnlCleanup').Children.Add($box) | Out-Null
-			$cleanupBoxes += $box
-		}
+		$window.FindName('txtPolicy').Text = 'Existing folder: inheritance and custom permissions are preserved. Review the current entries below.'
+		$window.FindName('pnlExistingAccess').Visibility = 'Visible'
+		$accessRows = @(Get-ScanFolderAccessRows -Acl $Acl -CleanupRules $CleanupRules)
+		$window.FindName('lstExistingRules').ItemsSource = $accessRows
+		$window.FindName('txtRuleCount').Text = "$($accessRows.Count) entries"
 	}
+	$window.FindName('chkEveryone').Add_Checked({ $window.FindName('pnlEveryoneWarning').Visibility = 'Visible' })
+	$window.FindName('chkEveryone').Add_Unchecked({ $window.FindName('pnlEveryoneWarning').Visibility = 'Collapsed' })
 	$window.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($DesktopUser)
 	$window.FindName('txtRecipient').Add_TextChanged({
 		$window.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($window.FindName('txtRecipient').Text)
@@ -667,7 +850,7 @@ function Show-ScanFolderAccessDialog {
 		return @{
 			Recipient = $window.FindName('txtRecipient').Text.Trim()
 			AllowEveryoneModify = [bool]$window.FindName('chkEveryone').IsChecked
-			RemoveRules = @($cleanupBoxes | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
+			RemoveRules = @($accessRows | Where-Object { $_.CanRemove -and $_.Remove } | ForEach-Object { $_.Rule })
 		}
 	}
 	return $null

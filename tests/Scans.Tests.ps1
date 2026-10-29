@@ -1077,6 +1077,7 @@ Describe 'Folder access review dialog' {
 		$script:progressWindow = $null
 		$script:accessAccepted = $true
 		$script:inspectAccessWindow = { param($window) }
+		Mock Resolve-ScanPrincipalDisplay { "TEST\account-$($Sid.Value.Split('-')[-1])" }
 		Mock Set-WindowTheme {
 			$window | Add-Member ScriptMethod ShowDialog {
 				& $script:inspectAccessWindow $this
@@ -1088,8 +1089,8 @@ Describe 'Folder access review dialog' {
 	It 'defaults to the desktop user and explicitly discloses a different elevated identity' {
 		$script:inspectAccessWindow = {
 			param($window)
-			$window.FindName('txtIdentity').Text | Should Match 'These accounts differ'
-			$window.FindName('txtIdentity').Text | Should Match 'not automatically for the elevated account'
+			$window.FindName('txtIdentityWarning').Text | Should Match 'These accounts differ'
+			$window.FindName('txtIdentityWarning').Text | Should Match 'not automatically for the elevated account'
 			$window.FindName('txtRecipient').Text | Should Be 'DOMAIN\recipient'
 			$window.FindName('chkEveryone').IsChecked | Should Be $false
 			$window.FindName('txtPolicy').Text | Should Match 'inheritance will be disabled'
@@ -1105,7 +1106,7 @@ Describe 'Folder access review dialog' {
 		$script:inspectAccessWindow = {
 			param($window)
 			$window.FindName('txtRecipient').Text | Should BeNullOrEmpty
-			$window.FindName('txtIdentity').Text | Should Match 'No desktop user was detected'
+			$window.FindName('txtIdentityWarning').Text | Should Match 'No desktop user was detected'
 			$window.FindName('btnAccept').IsEnabled | Should Be $false
 			$window.FindName('txtRecipient').Text = '   '
 			$window.FindName('btnAccept').IsEnabled | Should Be $false
@@ -1123,11 +1124,18 @@ Describe 'Folder access review dialog' {
 		$script:inspectAccessWindow = {
 			param($window)
 			$window.FindName('txtPolicy').Text | Should Match 'inheritance and custom permissions are preserved'
-			$window.FindName('txtExistingRules').Text | Should Match 'S-1-1-0'
-			$boxes = $window.FindName('pnlCleanup').Children
-			$boxes.Count | Should Be 2
-			foreach ($box in $boxes) { $box.IsChecked | Should Be $false }
-			$boxes[0].IsChecked = $true
+			$rows = $window.FindName('lstExistingRules').ItemsSource
+			$rows.Count | Should Be 2
+			foreach ($row in $rows) {
+				$row.Remove | Should Be $false
+				$row.Principal | Should Match 'TEST\\account-'
+				$row.CanRemove | Should Be $true
+			}
+			$rows[0].Remove = $true
+			$window.FindName('chkEveryone').IsChecked = $true
+			$window.FindName('pnlEveryoneWarning').Visibility | Should Be ([System.Windows.Visibility]::Visible)
+			$window.FindName('chkEveryone').IsChecked = $false
+			$window.FindName('pnlEveryoneWarning').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
 			$window.FindName('chkEveryone').IsChecked = $true
 		}
 		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' -Acl $acl -CleanupRules $candidates
@@ -1141,6 +1149,144 @@ Describe 'Folder access review dialog' {
 			$script:accessAccepted = $accepted
 			Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' | Should BeNullOrEmpty
 		}
+	}
+
+	It 'hides the existing permissions section for new folders and keeps safe defaults' {
+		$script:inspectAccessWindow = {
+			param($window)
+			$window.FindName('pnlExistingAccess').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
+			$window.FindName('txtIdentityWarning').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
+			$window.FindName('pnlEveryoneWarning').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
+			$window.FindName('lstExistingRules').View.Columns.Count | Should Be 6
+			$window.FindName('txtFolder').Text | Should Be 'C:\scans & <example>'
+		}
+		Show-ScanFolderAccessDialog -FolderPath 'C:\scans & <example>' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\recipient' | Out-Null
+	}
+
+	It 'keeps warning text readable against the light and dark panel backgrounds' {
+		$script:inspectAccessWindow = {
+			param($window)
+			$foreground = $window.FindName('txtIdentityWarning').Foreground.Color
+			$background = [System.Windows.Media.ColorConverter]::ConvertFromString($script:thBgAlt)
+			$luminance = foreach ($color in @($foreground, $background)) {
+				$channels = foreach ($channel in @($color.R, $color.G, $color.B)) {
+					$value = $channel / 255.0
+					if ($value -le 0.04045) { $value / 12.92 } else { [Math]::Pow(($value + 0.055) / 1.055, 2.4) }
+				}
+				0.2126 * $channels[0] + 0.7152 * $channels[1] + 0.0722 * $channels[2]
+			}
+			$ratio = ([Math]::Max($luminance[0], $luminance[1]) + 0.05) / ([Math]::Min($luminance[0], $luminance[1]) + 0.05)
+			($ratio -ge 4.5) | Should Be $true
+		}
+		foreach ($dark in @($true, $false)) {
+			$script:useDarkTheme = $dark
+			$script:thBgAlt = if ($dark) { '#073642' } else { '#eee8d5' }
+			Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' | Out-Null
+		}
+	}
+
+	It 'does not return an ineligible row even if its model is marked for removal' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;FA;;;SY)')
+		$script:inspectAccessWindow = {
+			param($window)
+			$window.FindName('lstExistingRules').ItemsSource[0].Remove = $true
+		}
+		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\recipient' -Acl $acl
+		$result.RemoveRules.Count | Should Be 0
+	}
+
+	It 'binds the table removal checkbox to the exact returned ACE' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;0x1301bf;;;WD)(A;OICI;FA;;;SY)')
+		$candidates = @(Get-ScanFolderCleanupRules -Acl $acl -ScanSid ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')))
+		$script:tableBindingError = $null
+		Mock Set-WindowTheme {
+			$window.WindowStartupLocation = 'Manual'
+			$window.Left = -32000
+			$window.Top = -32000
+			$window.ShowActivated = $false
+			$window.Add_ContentRendered({
+				try {
+					$table = $this.FindName('lstExistingRules')
+					$table.UpdateLayout()
+					$index = 0
+					while (-not $table.Items[$index].CanRemove) { $index++ }
+					$pending = [System.Collections.Generic.Queue[System.Windows.DependencyObject]]::new()
+					$pending.Enqueue($table.ItemContainerGenerator.ContainerFromIndex($index))
+					$checkbox = $null
+					while ($pending.Count -and -not $checkbox) {
+						$node = $pending.Dequeue()
+						if ($node -is [System.Windows.Controls.CheckBox]) { $checkbox = $node }
+						else {
+							for ($i = 0; $i -lt [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($node); $i++) {
+								$pending.Enqueue([System.Windows.Media.VisualTreeHelper]::GetChild($node, $i))
+							}
+						}
+					}
+					if (-not $checkbox) { throw 'Removal checkbox was not rendered.' }
+					$checkbox.IsChecked = $true
+				}
+				catch { $script:tableBindingError = $_.Exception.Message }
+				finally { $this.DialogResult = $true }
+			})
+		}
+		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\recipient' -Acl $acl -CleanupRules $candidates
+		$script:tableBindingError | Should BeNullOrEmpty
+		$result.RemoveRules.Count | Should Be 1
+		$result.RemoveRules[0].IdentityReference.Value | Should Be 'S-1-1-0'
+	}
+}
+
+Describe 'Readable folder permission rows' {
+	BeforeEach {
+		Initialize-TestTheme
+	}
+
+	It 'resolves a well-known SID to its Windows account name' {
+		$sid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+		Resolve-ScanPrincipalDisplay $sid | Should Be $sid.Translate([System.Security.Principal.NTAccount]).Value
+	}
+
+	It 'marks an unresolved SID honestly rather than inventing a username' {
+		$result = Resolve-ScanPrincipalDisplay ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-4294967294'))
+		$result | Should Match '^Unresolved account \(S-1-5-21-'
+	}
+
+	It 'shows readable access, source, scope, deny indicators, and exact tooltip data' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:AI(D;;SD;;;WD)(A;OICI;FA;;;SY)(A;OICI;0x100007;;;S-1-5-21-1-2-3-1001)(A;OICIID;0x1301bf;;;WD)')
+		Mock Resolve-ScanPrincipalDisplay { "Resolved $($Sid.Value)" }
+		$rows = @(Get-ScanFolderAccessRows -Acl $acl)
+		$rows.Count | Should Be 4
+		$rows[0].Type | Should Be 'Deny'
+		$rows[0].Color | Should Be '#cb4b16'
+		$rows[0].Scope | Should Be 'This folder'
+		$rows[1].Access | Should Be 'Full control'
+		$rows[2].Access | Should Be 'Scan: read, write, append'
+		$rows[3].Access | Should Be 'Modify'
+		$rows[3].Source | Should Be 'Inherited'
+		$rows[3].Scope | Should Be 'This folder, subfolders, files'
+		$rows[3].CanRemove | Should Be $false
+		$rows[3].Details | Should Match 'SID: S-1-1-0'
+		Assert-MockCalled Resolve-ScanPrincipalDisplay -Times 3 -Exactly -Scope It
+	}
+
+	It 'does not enable removal for another rule on the same principal or inherited entries' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:AI(A;;0x1301bf;;;WD)(A;OICI;0x1301bf;;;WD)(A;OICIID;0x1301bf;;;WD)')
+		$candidates = @(Get-ScanFolderCleanupRules -Acl $acl -ScanSid ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')))
+		$rows = @(Get-ScanFolderAccessRows -Acl $acl -CleanupRules $candidates)
+		@($rows | Where-Object { $_.CanRemove }).Count | Should Be 1
+		@($rows | Where-Object { $_.CanRemove })[0].Scope | Should Be 'This folder, subfolders, files'
+	}
+
+	It 'describes inherit-only and one-level rules without claiming they apply to the folder' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:(A;CINPIO;FR;;;SY)')
+		$row = @(Get-ScanFolderAccessRows -Acl $acl)[0]
+		$row.Scope | Should Be 'subfolders (one level)'
+		$row.Access | Should Match '^Special:'
 	}
 }
 
