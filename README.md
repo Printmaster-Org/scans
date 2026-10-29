@@ -201,6 +201,12 @@ Words come from the [EFF Short Wordlist 1](https://www.eff.org/dice) (CC BY 3.0 
 
 Startup failures stop setup with an error dialog. Failed setup steps no longer interrupt with popups: setup continues with independent steps, and the Done page lists each failure with the original error and how to fix it. Domain trust failures, access denied, and shares in use have specific guidance; unexpected errors keep their original details with general troubleshooting guidance. Steps that depend on a failed step (for example the share after a failed folder) are skipped and listed.
 
+### Desktop shortcut fails
+
+Versions v3.0.0 and v3.0.1 can report **Failed to create desktop shortcut: Value does not fall within the expected range** when launched through the release loader. The folder and share can still work; a shortcut failure is optional. Until a release containing the fix is published, create a shortcut to your configured scans folder in File Explorer. After upgrading, rerun with only **Add desktop shortcut** selected under **Advanced options** to avoid changing the account password or folder/share permissions again.
+
+The development version also assigns each setup window its own Windows taskbar identity, keeping the printer logo separate from PowerShell's taskbar grouping. These utility fixes are not delivered by refreshing the loader alone.
+
 ## Development and deployment
 
 Both public entrypoints select manually published, versioned GitHub Releases. Merging utility code does not deploy it to users. Merging loader changes does update the raw-main loader; website loader changes require a Pages refresh.

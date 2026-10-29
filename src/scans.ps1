@@ -339,19 +339,113 @@ using System.Runtime.InteropServices;
 public class DwmHelper {
     [DllImport("dwmapi.dll", PreserveSig = true)]
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
-    [DllImport("shell32.dll", SetLastError = true)]
-    public static extern void SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string AppID);
 }
 "@ -ErrorAction Stop
 	} catch { }
 }
 if (([System.Management.Automation.PSTypeName]'DwmHelper').Type) {
 	$script:hasDwmTheming = $true
-	# Give the process its own taskbar identity so Windows shows our icon instead of PowerShell's
-	try { [DwmHelper]::SetCurrentProcessExplicitAppUserModelID('mstrhakr.scans.setup') } catch { }
+}
+
+function Initialize-ScanTaskbarInterop {
+	if (([System.Management.Automation.PSTypeName]'ScanTaskbarIdentity').Type) { return }
+	Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ScanTaskbarIdentity {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PropertyKey {
+        public Guid Format;
+        public uint Id;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct PropVariant {
+        [FieldOffset(0)] public ushort Type;
+        [FieldOffset(8)] public IntPtr Text;
+    }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key);
+        void GetValue(ref PropertyKey key, out PropVariant value);
+        void SetValue(ref PropertyKey key, ref PropVariant value);
+        void Commit();
+    }
+
+    [DllImport("shell32.dll", PreserveSig = false)]
+    private static extern void SHGetPropertyStoreForWindow(
+        IntPtr hwnd, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(ref PropVariant value);
+
+    private static PropertyKey ApplicationIdKey() {
+        return new PropertyKey {
+            Format = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), Id = 5
+        };
+    }
+
+    private static IPropertyStore GetStore(IntPtr hwnd) {
+        Guid iid = typeof(IPropertyStore).GUID;
+        IPropertyStore store;
+        SHGetPropertyStoreForWindow(hwnd, ref iid, out store);
+        return store;
+    }
+
+    public static void SetApplicationId(IntPtr hwnd, string applicationId) {
+        IPropertyStore store = GetStore(hwnd);
+        PropVariant value = new PropVariant();
+        try {
+            PropertyKey key = ApplicationIdKey();
+            value.Type = 31; // VT_LPWSTR; the window store copies the string.
+            value.Text = Marshal.StringToCoTaskMemUni(applicationId);
+            store.SetValue(ref key, ref value);
+        }
+        finally {
+            PropVariantClear(ref value);
+            Marshal.ReleaseComObject(store);
+        }
+    }
+
+    public static string GetApplicationId(IntPtr hwnd) {
+        IPropertyStore store = GetStore(hwnd);
+        PropVariant value = new PropVariant();
+        try {
+            PropertyKey key = ApplicationIdKey();
+            store.GetValue(ref key, out value);
+            return value.Type == 31 ? Marshal.PtrToStringUni(value.Text) : null;
+        }
+        finally {
+            PropVariantClear(ref value);
+            Marshal.ReleaseComObject(store);
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function Set-ScanWindowTaskbarIdentity($Window) {
+	$Window.Add_SourceInitialized({
+		try {
+			Initialize-ScanTaskbarInterop
+			$hwnd = [System.Windows.Interop.WindowInteropHelper]::new($this).Handle
+			# A window-level identity overrides packaged PowerShell's taskbar grouping
+			# without changing the identity of the user's PowerShell process.
+			[ScanTaskbarIdentity]::SetApplicationId($hwnd, 'mstrhakr.scans.setup')
+			Write-Verbose 'Assigned the PrintMaster Scans taskbar identity to the window.'
+		}
+		catch {
+			Write-Warning "Could not set the Scans taskbar identity; Windows may show the PowerShell icon: $($_.Exception.Message)"
+		}
+	})
 }
 
 function Set-WindowTheme($window) {
+	Set-ScanWindowTaskbarIdentity $window
 	if (-not $script:hasDwmTheming) { return }
 	$window.Add_SourceInitialized({
 		try {

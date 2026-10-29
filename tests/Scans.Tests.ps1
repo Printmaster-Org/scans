@@ -2366,6 +2366,49 @@ Describe 'Readable folder permission rows' {
 	}
 }
 
+Describe 'Taskbar window identity' {
+	BeforeAll {
+		Add-Type -AssemblyName PresentationFramework
+		Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ScanTaskbarTestNative {
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+	}
+
+	It 'assigns the native window identity independently of DWM support and retains the printer icon' {
+		$script:hasDwmTheming = $false
+		$window = [System.Windows.Window]::new()
+		$window.Icon = New-PrintMasterIcon
+		try {
+			Set-WindowTheme $window
+			$hwnd = [System.Windows.Interop.WindowInteropHelper]::new($window).EnsureHandle()
+			[ScanTaskbarIdentity]::GetApplicationId($hwnd) | Should Be 'mstrhakr.scans.setup'
+			# WM_GETICON / ICON_BIG verifies that WPF supplied a native taskbar icon.
+			$icon = [ScanTaskbarTestNative]::SendMessage($hwnd, 0x7F, [IntPtr]1, [IntPtr]::Zero)
+			$icon | Should Not Be ([IntPtr]::Zero)
+		}
+		finally { $window.Close() }
+	}
+
+	It 'reports taskbar identity failures without preventing the window from opening' {
+		Mock Initialize-ScanTaskbarInterop { throw 'Native identity unavailable' }
+		Mock Write-Warning { }
+		$window = [System.Windows.Window]::new()
+		try {
+			Set-ScanWindowTaskbarIdentity $window
+			[System.Windows.Interop.WindowInteropHelper]::new($window).EnsureHandle() | Out-Null
+			Assert-MockCalled Write-Warning -Times 1 -Exactly -Scope It -ParameterFilter {
+				$Message -match 'Could not set the Scans taskbar identity.*Native identity unavailable'
+			}
+		}
+		finally { $window.Close() }
+	}
+}
+
 Describe 'WPF window markup' {
 	It 'renders the embedded PrintMaster window logo without external files' {
 		Add-Type -AssemblyName PresentationFramework
