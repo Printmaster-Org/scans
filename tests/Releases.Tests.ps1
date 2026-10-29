@@ -172,8 +172,12 @@ Describe 'Loader elevation' {
 	It 'refuses to run a file that changed after the loader verified it' {
 		$hash = & $script:writePayload 0
 		Add-Content -LiteralPath $script:payload -Value '# tampered'
-		& $script:hostExe -NoProfile -NonInteractive -EncodedCommand (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash) 2>$null
-		$LASTEXITCODE | Should Be (Get-ScanVerifyFailedExitCode)
+		# Capture stderr through the process API: Windows PowerShell 5.1 turns redirected native
+		# stderr into a terminating RemoteException when ErrorActionPreference is Stop.
+		$stderr = Join-Path $TestDrive 'stderr.txt'
+		$child = Start-Process -FilePath $script:hostExe -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash)) -NoNewWindow -Wait -PassThru -RedirectStandardError $stderr
+		$child.ExitCode | Should Be (Get-ScanVerifyFailedExitCode)
+		(Get-Content -LiteralPath $stderr -Raw) | Should Match 're-check failed'
 		Test-Path -LiteralPath $script:marker | Should Be $false
 	}
 
