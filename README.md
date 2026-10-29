@@ -155,7 +155,13 @@ If Windows reports `InvalidPassword` (or `net user` system error `2245` on older
 
 Choosing **Cancel setup** or closing the password dialog stops the remaining setup steps and leaves **Copy Password** disabled. After a successful retry, setup continues normally and copies only the accepted password when requested.
 
-Use the generated password or a longer password containing uppercase and lowercase letters, numbers, and symbols, without the username. Generated passwords are not guaranteed to satisfy every policy. If the password is still rejected, ask your administrator for the effective minimum length, complexity, history, and any additional restrictions rather than disabling the policy.
+Use the generated passphrase or a long password of your own, without the username. Generated passphrases are not guaranteed to satisfy every policy. If the password is still rejected, ask your administrator for the effective minimum length, complexity, history, and any additional restrictions rather than disabling the policy.
+
+### Generated passphrases
+
+The setup window and **Generate** create a passphrase such as `Brook-Ocean7-Gnat-Plaza-Rumor`: five capitalized words joined by hyphens, with one random digit after one random word. Current guidance (for example NIST SP 800-63B) treats length as the main source of password strength, so a passphrase is stronger and easier to type on a printer panel than a short random string. Each passphrase is 20–30 characters with about 57 bits of entropy. That stays within the 32-character password limit common on printers, and the mix of upper, lower, digit, and symbol still satisfies the Windows complexity policy.
+
+Words come from the [EFF Short Wordlist 1](https://www.eff.org/dice) (CC BY 3.0 US), embedded in the utility so releases remain a single hash-verified script. `yo-yo`, `scan`, and `user` are removed so hyphens only separate words and passphrases don't resemble the account name. Selection uses a cryptographic random generator with rejection sampling, so every word is equally likely. Logs record the word count and estimated strength, never the passphrase. On older systems that fall back to `net user`, setup automatically answers its "longer than 14 characters" confirmation prompt.
 
 ### Other setup errors
 
@@ -199,7 +205,7 @@ pwsh.exe -NoProfile -STA -File .\tests\Invoke-Tests.ps1
 node --test .\tests\site.test.cjs .\tests\embed.test.cjs
 ```
 
-The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded and selected binding tests render off-screen. Legacy share tests construct real in-memory CIM security descriptors but mock the machine-changing calls. Tests cover password failures, error-popup routing, account visibility, folder setup, share conflicts/reviews/partial failures, network configuration, shortcuts, generated password shape, and setup options. The generator tests do not claim that every generated password satisfies policy.
+The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded and selected binding tests render off-screen. Legacy share tests construct real in-memory CIM security descriptors but mock the machine-changing calls. Tests cover password failures, error-popup routing, account visibility, folder setup, share conflicts/reviews/partial failures, network configuration, shortcuts, generated passphrase format and unbiased word selection, and setup options. The generator tests do not claim that every generated passphrase satisfies policy.
 
 The [release tests](tests/Releases.Tests.ps1) cover loader selection, verification failures, temporary-file cleanup, package integrity, and site generation. Site rendering tests use Node's built-in test runner with no additional dependencies.
 
