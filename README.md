@@ -127,17 +127,11 @@ The main website can frame `https://scans.printmaster.work/?embed=1` at `/scans/
 
 The handshake restricts embed-mode activation, not who can frame the public standalone site. GitHub Pages cannot set a custom HTTP `Content-Security-Policy: frame-ancestors` header; a meta tag cannot enforce it. If the domain later uses a configurable edge/server, set `frame-ancestors 'self' https://printmaster.work` there and avoid `X-Frame-Options: DENY`/`SAMEORIGIN`, which would block the cross-origin main-site frame.
 
-Work on a feature branch and open a pull request. The [CI workflow](.github/workflows/ci.yml) runs syntax checks and mocked Pester tests on Windows using both Windows PowerShell 5.1 and PowerShell 7. Its **Required checks** job passes only when both test jobs succeed, including when using a merge queue. CI also runs after pushes to `main` and can be started manually.
+Direct, fast-forward pushes to `main` are permitted; feature branches and pull requests are optional. Run the relevant local tests before pushing. The [CI workflow](.github/workflows/ci.yml) runs syntax checks and mocked Pester tests on Windows using both Windows PowerShell 5.1 and PowerShell 7. Its **Required checks** job passes only when both test jobs succeed, including when using a merge queue. CI also runs after pushes to `main` and can be started manually.
 
-External actions are pinned to full commit SHAs. [Dependabot](.github/dependabot.yml) checks GitHub Actions dependencies weekly and opens update PRs; updates must pass the same required CI.
+External actions are pinned to full commit SHAs. [Dependabot](.github/dependabot.yml) checks GitHub Actions dependencies weekly and opens update PRs.
 
-To enforce this deployment gate, protect `main` in **Settings > Branches**:
-
-- Require a pull request before merging. Reviewer approval is optional for a solo-maintained repository.
-- Require the **Required checks** status check and require branches to be up to date before merging.
-- Apply the rules to administrators as well, and disallow force pushes and branch deletion.
-
-The workflow file alone does not enforce these settings. A required check can be configured before its first run; it remains pending until a pull request containing the workflow runs successfully. Do not push directly to `main` or bypass the required check.
+`main` does not require branch protection or pre-merge status checks. Post-push CI detects failures but does not prevent a push or merge. Release preparation and Pages promotion still require successful main-push CI for the selected source commits. Utility changes reach users only through a manually published release; the raw-main loader itself still changes immediately when pushed.
 
 ### Running tests locally
 

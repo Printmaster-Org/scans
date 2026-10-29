@@ -10,7 +10,7 @@ This branch implements steps 9-10 below: the canonical loader is now root `scans
 
 1. Finish testing this preparation branch. It intentionally keeps the existing root utility and raw-main command working. It does not transfer the repository, configure DNS, or deploy anything.
 2. Transfer `mstrhakr/scans` to **printmaster-org/scans**, preserving the repository name. Transfer before merging this preparation PR. GitHub normally redirects repository links, but explicitly verify old clone and raw-content URLs; do not recreate a repository at the old location.
-3. Update the local remote to the transferred repository using your SSH host alias as appropriate. Verify Actions is enabled and allowed actions are permitted by organization policy. Verify the `main` protection still requires PRs, up-to-date branches, and **Required checks**, including for admins. Check the transferred PR and CI runs under the new owner.
+3. Update the local remote to the transferred repository using your SSH host alias as appropriate. Verify Actions is enabled and allowed actions are permitted by organization policy. Check the transferred PR and CI runs under the new owner. These are historical transfer steps; the current development policy permits direct, fast-forward pushes to `main`.
 4. Merge the preparation PR after CI passes. The release workflows intentionally refuse publication from any other repository. The old command still uses the root utility during bootstrap.
 5. Configure GitHub Pages and DNS as below.
 6. Push a new stable SemVer tag pointing at a commit tested by main-push CI. This starts **Prepare release** automatically. The latest historical tag at preparation time was `2.0.2.0`; `v2.1.0` is a reasonable next feature release. Old four-part tags are not renamed or parsed as SemVer. **Run workflow** on `main` remains available to retry an existing tag, including one pushed before this trigger existed.
@@ -29,16 +29,16 @@ Do not switch the root entry point before the first stable manifest works: an ab
 - Once the certificate is provisioned, enable **Enforce HTTPS**. DNS and certificate provisioning can take time; do not advertise the new command before it works.
 - Configure the `github-pages` deployment environment to allow `main` and stable release tags matching `v*`. Release-triggered deployments use tag refs, not `main`. A main-only environment rule would block those deployments. Optional required environment reviewers add a second explicit promotion approval.
 - The prepare workflow has `contents: write` only in its draft job. Release preparation and site generation receive `actions: read` to inspect existing CI results. Only deployment receives `pages: write` and `id-token: write`.
-- Retain main protection. These workflows publish release assets and Pages artifacts, not commits. No bot bypass, PAT, or organization-wide policy relaxation is required.
+- `main` permits direct, fast-forward pushes without branch protection. Run local tests before pushing and check post-push CI. Release preparation and Pages promotion still require successful main-push CI for the selected source commits. These workflows publish release assets and Pages artifacts, not commits; no bot bypass, PAT, or organization-wide policy relaxation is required.
 - If moving/removing Pages later, remove or update its DNS mapping; do not leave a dangling custom domain.
 
 Organization policies may disallow third-party actions or require environment approval. Resolve those settings explicitly rather than granting a broad bypass.
 
 ## Dependency updates
 
-Dependabot groups weekly GitHub Actions updates into separate patch/minor and major PRs. Enable **Allow auto-merge** in repository settings. The Dependabot auto-merge workflow verifies bot-authored commits and enables squash auto-merge only when the highest update type in the PR is patch or minor. Required checks and branch protection still gate merging; no approval or protection bypass is granted. Major updates require a maintainer to review and merge.
+Dependabot groups weekly GitHub Actions updates into separate patch/minor and major PRs. Enable **Allow auto-merge** in repository settings. The Dependabot auto-merge workflow verifies bot-authored commits and enables squash auto-merge only when the highest update type in the PR is patch or minor. With branch protection disabled, CI is not an enforced pre-merge gate; do not rely on auto-merge to wait for checks. Major updates require a maintainer to review and merge.
 
-The privileged workflow runs on `pull_request_target` without checking out or executing PR code. Its external metadata action is SHA-pinned. If a PR falls behind main, the strict up-to-date requirement still applies; Dependabot must update it before it can merge. Existing PRs may need a Dependabot rebase to trigger the new workflow after it lands.
+The privileged workflow runs on `pull_request_target` without checking out or executing PR code. Its external metadata action is SHA-pinned. Existing PRs may need a Dependabot rebase to trigger the new workflow after it lands.
 
 ## Release and promotion model
 
