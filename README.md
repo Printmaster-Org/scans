@@ -97,9 +97,9 @@ When finished, copy the password and click Done.
 
 Before changing the password of an existing local account, Scans explains the impact and asks for confirmation. Declining cancels setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
 
-### Themed dialogs (unreleased)
+### Themed dialogs
 
-Development builds on `main` use a shared Solarized light/dark dialog shell for account confirmation, folder access, password retry, startup/step errors, and clipboard confirmation. These changes are not yet in the stable utility. Dialogs carry the PrintMaster logo and attribution, center on their parent when available, and keep longer content scrollable with the action buttons visible.
+Since v2.2.0, Scans uses a shared Solarized light/dark dialog shell for account confirmation, folder access, password retry, startup/step errors, and clipboard confirmation. Dialogs carry the PrintMaster logo and attribution, center on their parent when available, and keep longer content scrollable with the action buttons visible.
 
 Existing-account confirmation offers **Change password** and **Cancel setup**, with Cancel as the keyboard default. Closing the window or pressing Escape is not consent. The same shell hosts text fields and custom actions: folder access keeps its recipient field, and password retry retains **Generate**, blank-input validation, **Retry**, and **Cancel setup**.
 
@@ -107,9 +107,9 @@ Shared dialog footers place an outlined, neutral **Cancel** to the left of the f
 
 This UI refactor does not implement password masking or secure-state changes. [Issue #29](https://github.com/Printmaster-Org/scans/issues/29) tracks generation, reveal controls, minimizing plaintext copies, command-argument exposure, logging safeguards, and clipboard cleanup. Until that work ships, passwords remain visible in entry fields and are held as strings before conversion for local-account cmdlets. Copying places the accepted secret on the clipboard; treat clipboard history/sync and screenshots as potential exposure.
 
-### Folder access review (unreleased)
+### Folder access review
 
-The following describes development code on `main`, not a promise that the current stable release includes it. No new release is published by pushing these changes.
+Available since v2.2.0. Earlier releases granted the scan account Full Control and added Everyone Modify (plus Domain Users Modify on domain-joined PCs) without review.
 
 When **Set folder permissions** is selected, a separate review asks which Windows user should receive scans. It defaults to the user of the desktop session hosting Scans, including an RDP session, not the elevated administrator token. If these identities differ, the dialog explains that **Apply permissions** confirms the receiving user. You can edit the recipient; if no desktop user is detected, you must enter one. The recipient cannot be the scan account.
 
@@ -133,9 +133,9 @@ Canceling the review or failing folder setup skips SMB share configuration and r
 
 Test a real scan before relying on the destination. Some printers require additional attributes, rename, or delete access; do not broaden permissions silently to make a test pass.
 
-### Existing SMB shares (unreleased)
+### Existing SMB shares
 
-Development builds on `main` check the selected local folder and any existing share's path before changing share permissions. A conflicting name opens **Share name conflict**: choose another share name to check or cancel share setup. Scans never repoints, deletes, or recreates the conflicting share. Use the actual share name reported in the progress details for printer configuration.
+Since v2.2.0, Scans checks the selected local folder and any existing share's path before changing share permissions. A conflicting name opens **Share name conflict**: choose another share name to check or cancel share setup. Scans never repoints, deletes, or recreates the conflicting share. Use the actual share name reported in the progress details for printer configuration.
 
 New shares grant **Change**, not Full, to the explicitly qualified local scan account. This is the SMB permission layer; the folder's NTFS ACL still limits actual file operations. No Everyone share grant is added.
 
