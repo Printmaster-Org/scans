@@ -65,48 +65,79 @@ This script completely sets up the user environment for quick scan-to-SMB:
 - Enables File and Printer Sharing firewall rules (all that SMB scan-to-folder needs)
 - Optionally enables Network Discovery firewall rules. This is off by default because it's only useful for printers that browse the network for the PC instead of using a typed `\\PC\share` path. Scans never disables a Network Discovery rule that is already on. Versions up to v2.2.0 always enabled it.
 
-All settings are configurable through the UI before execution.
+Every step can be turned off under **Advanced options** before anything runs.
 
 ## Usage
 
-First choose the inputs — the password is randomly generated with a cryptographically secure generator. Screenshots use example credentials and simulated progress/completion states rendered from the current app UI; they do not show a real machine setup. Do not reuse the example password.
+Since v3.0.0, Scans is a four-page wizard: **Configure → Review → Apply → Done**. Nothing changes on the PC until you click **Apply** on the Review page. Screenshots use the example PC `FRONTDESK-PC` and simulated progress and results rendered from the current app UI; they do not show a real machine setup.
 
-![Setup](img/scans-setup.png)
+### 1. Configure
 
-The UI automatically matches your Windows theme (light or dark).
+Choose the scan account, password, scans folder, and share name. The password is a generated passphrase, hidden by default; **Show** reveals it and **Generate** creates a new one. The share name shows the network path printers will use.
 
-App windows use the PrintMaster logo and attribution. The scan-folder desktop shortcut keeps its original scan icon. The self-contained utility embeds the window logo as WPF vector artwork matching [site/logo.svg](site/logo.svg), so branding needs no extra download.
+![Configure page](img/scans-setup.png)
 
-![Setup Light Theme](img/scans-setup-theme.png)
+The UI automatically matches your Windows theme (light or dark). App windows use the PrintMaster logo and attribution; the scan-folder desktop shortcut keeps its original scan icon. The logo is embedded as WPF vector artwork matching [site/logo.svg](site/logo.svg), so branding needs no extra download.
 
-Click the gear icon to enable/disable individual steps.
+![Configure page in the light theme](img/scans-setup-theme.png)
 
-Choosing **Cancel** or closing the initial setup window exits normally without running the selected setup steps or displaying a loader error.
+**Advanced options** (collapsed by default) turns individual steps on or off: create or update the account, hide it from the sign-in screen, create the folder, set folder permissions, share the folder, add a desktop shortcut, check network settings, and the optional Network Discovery rules. Options that depend on a disabled step are disabled with it: folder permissions require creating the folder, and Network Discovery requires the network checks.
 
-![Settings](img/scans-settings.png)
+![Advanced options](img/scans-advanced.png)
 
-Wait for the utility to complete all changes.
+**Cancel** or closing the window on Configure or Review exits without changes.
 
-![Loading](img/scans-loading.png)
+### 2. Review
 
-When finished, copy the password and click Done.
+Review lists every change Scans will make. If a field is missing or invalid, **Next** stays on Configure and lists the problems. **Back** keeps all your choices.
 
-![Finished](img/scans-finished.png)
+![Review page](img/scans-review.png)
+
+### 3. Apply
+
+Apply shows live progress and an activity list. The window cannot be closed while a step is running. Folder access and existing-share reviews open as separate dialogs during this step (see below).
+
+![Apply page](img/scans-apply.png)
+
+### 4. Done
+
+Done reports one of four outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| **Ready for scanning** | Every selected step finished. |
+| **Ready, with optional problems** | Only optional steps (desktop shortcut, Network Discovery) failed. |
+| **Not ready for scanning** | A required step failed. The failed steps are listed first, with the error and how to fix it. |
+| **Setup canceled** | Setup stopped before finishing; connection details are hidden. |
+
+**Printer connection details** lists everything a printer's scan-to-folder settings may ask for: username (bare and `PC\user`), password, domain, host name, full host name (FQDN), share name, network paths by name and IP address, IPv4 addresses, SMB port 445, and the local folder. Each value has a **Copy** button. Prefer the host name; DHCP can change IP addresses, so reserve the address on the router if a printer needs it. The password row can be copied only if the password was set during this run.
+
+![Done page](img/scans-finished.png)
+
+**What happened** lists each step with its result, and **Copy summary** copies a plain-text report without the password. **Back to setup** returns to Configure with your choices kept, so you can fix a problem and run again.
+
+![Not ready for scanning](img/scans-not-ready.png)
 
 ### Existing account safety
 
-Before changing the password of an existing local account, Scans explains the impact and asks for confirmation. Declining cancels setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
+If the scan account already exists, Review warns that applying will change its password, which affects anything else that signs in with it. **Apply** stays disabled until you tick **Yes, change the password for this existing account**. If the account appears between Review and Apply, a confirmation dialog asks again; declining stops setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
+
+### Password handling
+
+Since v3.0.0, passwords are handled as follows ([issue #29](https://github.com/Printmaster-Org/scans/issues/29)):
+
+- Password fields are masked by default. **Show** reveals the text until you hide it again.
+- The password stays in a .NET `SecureString` from the password box to the Windows account cmdlets. Plaintext is created only briefly for the legacy `net user` fallback on systems without the LocalAccounts module, and for Copy and Show.
+- Error messages and logs never include the password; text Windows echoes back is redacted.
+- **Copy** marks the clipboard entry so Windows clipboard history and cloud clipboard sync skip it. When the window closes, Scans clears the clipboard only if it still holds the copied password.
+
+These are exposure reductions, not guarantees. `SecureString` limits casual exposure in memory dumps and logs; it is not encryption at rest. PowerShell cannot zero every intermediate string. The legacy `net user` fallback must pass the password as a command-line argument, so it is briefly visible to other administrators' process listings. Clipboard managers that ignore the Windows exclusion formats can still capture a copied password, and screen recording can capture a revealed one.
 
 ### Themed dialogs
 
-Since v2.2.0, Scans uses a shared Solarized light/dark dialog shell for account confirmation, folder access, password retry, startup/step errors, and clipboard confirmation. Dialogs carry the PrintMaster logo and attribution, center on their parent when available, and keep longer content scrollable with the action buttons visible.
+Scans uses a shared Solarized light/dark dialog shell for folder access, existing-share reviews, share name conflicts, the late existing-account confirmation, and startup errors. Dialogs carry the PrintMaster logo and attribution, center on the wizard, and keep longer content scrollable with the action buttons visible.
 
-Existing-account confirmation offers **Change password** and **Cancel setup**, with Cancel as the keyboard default. Closing the window or pressing Escape is not consent. The same shell hosts text fields and custom actions: folder access keeps its recipient field, and password retry retains **Generate**, blank-input validation, **Retry**, and **Cancel setup**.
-
-Shared dialog footers place an outlined, neutral **Cancel** to the left of the filled, emphasized approval action at the far right. Folder/share permission confirmations initially focus Cancel and do not default Enter to approval. Their permission tables keep themed, readable full-row hover and selection states, including when keyboard focus moves elsewhere; a border distinguishes selection and keyboard focus.
-
-This UI refactor does not implement password masking or secure-state changes. [Issue #29](https://github.com/Printmaster-Org/scans/issues/29) tracks generation, reveal controls, minimizing plaintext copies, command-argument exposure, logging safeguards, and clipboard cleanup. Until that work ships, passwords remain visible in entry fields and are held as strings before conversion for local-account cmdlets. Copying places the accepted secret on the clipboard; treat clipboard history/sync and screenshots as potential exposure.
-
+Shared dialog footers place an outlined, neutral **Cancel** to the left of the filled, emphasized approval action at the far right. Confirmations focus Cancel first; closing the window or pressing Escape is not consent. Folder/share permission confirmations do not default Enter to approval. Their permission tables keep themed, readable full-row hover and selection states, including when keyboard focus moves elsewhere; a border distinguishes selection and keyboard focus.
 ### Folder access review
 
 Available since v2.2.0. Earlier releases granted the scan account Full Control and added Everyone Modify (plus Domain Users Modify on domain-joined PCs) without review.
@@ -135,7 +166,7 @@ Test a real scan before relying on the destination. Some printers require additi
 
 ### Existing SMB shares
 
-Since v2.2.0, Scans checks the selected local folder and any existing share's path before changing share permissions. A conflicting name opens **Share name conflict**: choose another share name to check or cancel share setup. Scans never repoints, deletes, or recreates the conflicting share. Use the actual share name reported in the progress details for printer configuration.
+Since v2.2.0, Scans checks the selected local folder and any existing share's path before changing share permissions. A conflicting name opens **Share name conflict**: choose another share name to check or cancel share setup. Scans never repoints, deletes, or recreates the conflicting share. Use the share name shown on the Done page for printer configuration.
 
 New shares grant **Change**, not Full, to the explicitly qualified local scan account. This is the SMB permission layer; the folder's NTFS ACL still limits actual file operations. No Everyone share grant is added.
 
@@ -143,7 +174,7 @@ For an existing share pointing to the selected folder, **Review SMB share access
 
 **Apply share access** adds Change only if the scan account does not already have Change or Full. Existing scan Full is retained unless you select its removal; selecting it replaces Full with Change. Other selected Allow grants are removed without resetting the share ACL. Preserved group grants can still give broader access, and Deny entries can still block scanning; this is not an effective-access calculation.
 
-Cancel, Escape, or closing a review makes no share changes. Scans rechecks the share path, scope, and ACL after review and stops if they changed. This is a best-effort concurrency check, not an atomic lock against other administrators. Special/scoped or unreadable shares are refused rather than guessed. If a later write fails, progress details report successful partial changes; no automatic rollback is attempted. Earlier account/folder work is not rolled back, and independent selected steps can continue.
+Cancel, Escape, or closing a review makes no share changes. Scans rechecks the share path, scope, and ACL after review and stops if they changed. This is a best-effort concurrency check, not an atomic lock against other administrators. Special/scoped or unreadable shares are refused rather than guessed. If a later write fails, the Done page reports successful partial changes; no automatic rollback is attempted. Earlier account/folder work is not rolled back, and independent selected steps can continue.
 
 Without SMB cmdlets, Scans uses structured WMI lookup and a create-only WMI operation with an explicit Change ACL for new shares. It refuses to edit existing shares in this mode; configure them in Windows or rerun with SMB cmdlets. Lookup failures are errors, never evidence that a share is absent. Validate both normal and legacy paths on a disposable VM and test real printer delivery before release.
 
@@ -151,9 +182,10 @@ Without SMB cmdlets, Scans uses structured WMI lookup and a create-only WMI oper
 
 Windows can reject a scan-account password that does not meet the effective local or domain Group Policy requirements, even for a local account. A short, lowercase-only password may fail minimum-length or complexity rules.
 
-If Windows reports `InvalidPassword` (or `net user` system error `2245` on older systems), setup pauses and returns to password entry. Enter a replacement or click **Generate**, then **Retry**. Account setup is retried before hiding the account, setting folder permissions, configuring the SMB share, or running any other remaining steps. Your other setup choices are preserved. If Windows rejects another password, you can edit or generate one and retry again.
+If Windows reports `InvalidPassword` (or `net user` system error `2245` on older systems), setup pauses and the Apply page shows the error with a **New password** field. Enter a replacement or click **Generate**, then **Retry**. Account setup is retried before hiding the account, setting folder permissions, configuring the SMB share, or running any other remaining steps. Your other setup choices are preserved. If Windows rejects another password, you can edit or generate one and retry again.
 
-Choosing **Cancel setup** or closing the password dialog stops the remaining setup steps and leaves **Copy Password** disabled. After a successful retry, setup continues normally and copies only the accepted password when requested.
+![Inline password retry on the Apply page](img/scans-password-retry.png)
+Choosing **Cancel setup** stops the remaining setup steps and the Done page reports **Setup canceled**. After a successful retry, setup continues normally; the accepted password is written back to the Configure page and is the one shown on the Done page.
 
 Use the generated passphrase or a long password of your own, without the username. Generated passphrases are not guaranteed to satisfy every policy. If the password is still rejected, ask your administrator for the effective minimum length, complexity, history, and any additional restrictions rather than disabling the policy.
 
@@ -165,7 +197,7 @@ Words come from the [EFF Short Wordlist 1](https://www.eff.org/dice) (CC BY 3.0 
 
 ### Other setup errors
 
-Startup failures already stop setup with an error popup. Failed setup steps also show a popup and keep the error and remediation in the progress list. Domain trust failures, access denied, and shares in use have specific guidance; unexpected errors retain their original details with general troubleshooting guidance. Successful and skipped steps do not show error popups. Independent steps can continue after a failed step, and the final window reports **Completed with errors**.
+Startup failures stop setup with an error dialog. Failed setup steps no longer interrupt with popups: setup continues with independent steps, and the Done page lists each failure with the original error and how to fix it. Domain trust failures, access denied, and shares in use have specific guidance; unexpected errors keep their original details with general troubleshooting guidance. Steps that depend on a failed step (for example the share after a failed folder) are skipped and listed.
 
 ## Development and deployment
 
@@ -205,7 +237,7 @@ pwsh.exe -NoProfile -STA -File .\tests\Invoke-Tests.ps1
 node --test .\tests\site.test.cjs .\tests\embed.test.cjs
 ```
 
-The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded and selected binding tests render off-screen. Legacy share tests construct real in-memory CIM security descriptors but mock the machine-changing calls. Tests cover password failures, error-popup routing, account visibility, folder setup, share conflicts/reviews/partial failures, network configuration, shortcuts, generated passphrase format and unbiased word selection, and setup options. The generator tests do not claim that every generated passphrase satisfies policy.
+The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded and selected binding tests render off-screen. Legacy share tests construct real in-memory CIM security descriptors but mock the machine-changing calls. Tests cover the wizard pages and navigation, the review gate, Done-page outcomes and connection details, SecureString and clipboard handling, password failures and retry, account visibility, folder setup, share conflicts/reviews/partial failures, network configuration, shortcuts, generated passphrase format and unbiased word selection, and setup options. The generator tests do not claim that every generated passphrase satisfies policy.
 
 The [release tests](tests/Releases.Tests.ps1) cover loader selection, verification failures, temporary-file cleanup, package integrity, and site generation. Site rendering tests use Node's built-in test runner with no additional dependencies.
 
@@ -215,5 +247,6 @@ These checks do not replace a manual test of the real GUI and machine configurat
 
 - **Solarized theming** — auto-detects Windows light/dark mode, defaults to dark
 - **Platform support** — Windows 11 primary; Windows 10 22H2 best-effort compatibility
-- **Error remediation** — shared error popups and inline tips for common failures (password policy, trust relationship, access denied, share in use), plus dependent-step safeguards
+- **Guided wizard** — Configure, Review, Apply, Done; nothing changes until you apply, and Done lists every printer connection detail with Copy buttons
+- **Error remediation** — failed steps listed on the Done page with tips for common failures (password policy, trust relationship, access denied, share in use), plus dependent-step safeguards
 - **Portable utility** — no application installation; release loader verifies downloads before execution

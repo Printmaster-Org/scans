@@ -39,8 +39,8 @@
         </div>
         <figure class="preview">
           <div class="preview-heading"><span class="status-dot" aria-hidden="true"></span> YOUR PC. READY TO RECEIVE.</div>
-          <img src="img/scans-setup.png" alt="Scans setup window with account, folder, and share settings" width="426" height="243" fetchpriority="high">
-          <figcaption>Choose your account, folder, and share.<br>Provided by PrintMaster. Example credentials shown.</figcaption>
+          <img src="img/scans-setup.png" alt="Scans setup wizard Configure page with scan account, hidden generated passphrase, scans folder, and share name" width="704" height="641" fetchpriority="high">
+          <figcaption>Configure, review, apply, done.<br>Provided by PrintMaster. Example PC shown.</figcaption>
         </figure>
       </div>
       <nav class="container section-nav" aria-label="On this page"><span>A companion tool for the networks you manage</span><a href="#get-started">Setup</a><a href="#requirements">Requirements</a><a href="#releases">Releases</a></nav>
@@ -64,7 +64,7 @@
             <pre><code id="setup-command-text">irm https://scans.printmaster.work/scans.ps1 | iex</code></pre>
           </div>
           <p id="stable-status" role="status">Loading stable release information...</p>
-          <div class="setup-next"><span class="step-number">02</span><div><h3>Connect your printer</h3><p>Choose your account, folder, and share settings. Keep the generated passphrase or choose one that meets your organization's policy. After setup, enter the PC's SMB share address and scan-account credentials on your printer.</p></div></div>
+          <div class="setup-next"><span class="step-number">02</span><div><h3>Connect your printer</h3><p>The wizard walks you through account, folder, and share settings, then shows every change for review before applying it. Keep the generated passphrase or choose one that meets your organization's policy. When it finishes, copy the share address and scan-account credentials from the Done page into your printer.</p></div></div>
           <p class="fine-print">The loader downloads a version-specific GitHub release and verifies SHA-256 before running it. A download or verification failure stops execution; it never falls back to development code.</p>
         </div>
       </div>
