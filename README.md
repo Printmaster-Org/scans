@@ -97,6 +97,14 @@ When finished, copy the password and click Done.
 
 Before changing the password of an existing local account, Scans explains the impact and asks for confirmation. Declining cancels setup without changing the account. Accounts in the local Administrators group are never changed; choose another username or cancel setup. If Scans cannot verify group membership, it also refuses to change the account.
 
+### Themed dialogs (unreleased)
+
+Development builds on `main` use a shared Solarized light/dark dialog shell for account confirmation, folder access, password retry, startup/step errors, and clipboard confirmation. These changes are not yet in the stable utility. Dialogs carry the PrintMaster logo and attribution, center on their parent when available, and keep longer content scrollable with the action buttons visible.
+
+Existing-account confirmation offers **Change password** and **Cancel setup**, with Cancel as the keyboard default. Closing the window or pressing Escape is not consent. The same shell hosts text fields and custom actions: folder access keeps its recipient field, and password retry retains **Generate**, blank-input validation, **Retry**, and **Cancel setup**.
+
+This UI refactor does not implement password masking or secure-state changes. [Issue #29](https://github.com/Printmaster-Org/scans/issues/29) tracks generation, reveal controls, minimizing plaintext copies, command-argument exposure, logging safeguards, and clipboard cleanup. Until that work ships, passwords remain visible in entry fields and are held as strings before conversion for local-account cmdlets. Copying places the accepted secret on the clipboard; treat clipboard history/sync and screenshots as potential exposure.
+
 ### Folder access review (unreleased)
 
 The following describes development code on `main`, not a promise that the current stable release includes it. No new release is published by pushing these changes.
