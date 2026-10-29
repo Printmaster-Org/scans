@@ -26,7 +26,7 @@ $generatedNotes
 
 ## Run this version
 
-Requires Windows PowerShell 5.1 or PowerShell 7 on Windows, running as Administrator.
+Requires Windows PowerShell 5.1 or PowerShell 7 on Windows and administrator approval: the loader requests UAC when it is not already elevated.
 The pinned command becomes available after this release is published and its Pages deployment succeeds.
 
 ``````powershell

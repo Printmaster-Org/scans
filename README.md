@@ -31,7 +31,7 @@ The utility is maintained at **printmaster-org/scans**. The root script and the 
 irm https://raw.githubusercontent.com/printmaster-org/scans/main/scans.ps1 | iex
 ```
 
-The new loader selects the promoted stable release from the site's manifest, downloads its version-specific GitHub asset, checks SHA-256, and only then executes it. A version can be selected explicitly:
+The new loader selects the promoted stable release from the site's manifest, downloads its version-specific GitHub asset, checks SHA-256, and only then executes it. From a normal (non-administrator) PowerShell window it then requests administrator approval through UAC; from an elevated window it runs directly. The approved process re-hashes the same bytes it executes, so a temporary file swapped after verification is refused. Declining UAC cancels without changes, and the loader waits for setup to finish before deleting the temporary file. Pinned older versions are launched the same way. A version can be selected explicitly:
 
 ```powershell
 & ([scriptblock]::Create((irm https://scans.printmaster.work/scans.ps1))) -Version 'v2.1.0'
@@ -47,7 +47,7 @@ See the [transfer and release guide](docs/DEPLOYMENT.md) for rollout order, DNS,
 | --- | --- |
 | **OS** | Windows 11 primary; Windows 10 22H2 best-effort compatibility |
 | **PowerShell** | Windows PowerShell 5.1 or PowerShell 7 |
-| **Privileges** | Must be run as Administrator |
+| **Privileges** | Administrator approval (UAC prompt) or an elevated PowerShell window |
 | **Network** | Internet access to the release site and GitHub for the loader |
 
 Windows 7/8/8.1 and Windows Server are not validated support targets. Windows 10 compatibility is not a claim of continued Microsoft support. Legacy command fallbacks remain for now; removing them is a separate change.
