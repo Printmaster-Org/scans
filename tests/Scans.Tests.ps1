@@ -895,6 +895,130 @@ Describe 'Generated passwords' {
 	}
 }
 
+Describe 'Shared themed dialogs' {
+	BeforeEach {
+		Add-Type -AssemblyName PresentationFramework
+		Initialize-TestTheme
+		$script:dialogAccepted = $true
+		$script:inspectDialog = { param($window) }
+		Mock Set-WindowTheme {
+			$window | Add-Member ScriptMethod ShowDialog {
+				& $script:inspectDialog $this
+				return $script:dialogAccepted
+			} -Force
+		}
+	}
+
+	It 'supports source-owned input controls without treating runtime text as markup' {
+		$message = 'Account <test> & "example": {Binding Secret}'
+		$window = New-ScanDialog -Title $message -Message $message -Guidance $message `
+			-ContentXaml '<TextBox Name="txtInput"/>' -AcceptText 'Continue' -CancelText 'Stop'
+		$window.Title | Should Be "PrintMaster Scans - $message"
+		$window.FindName('txtMessage').Text | Should Be $message
+		$window.FindName('txtGuidance').Text | Should Be $message
+		$window.FindName('txtInput') | Should Not BeNullOrEmpty
+		$window.FindName('btnAccept').Content | Should Be 'Continue'
+		$window.FindName('btnCancel').Content | Should Be 'Stop'
+		$window.FindName('txtProvider').Text | Should Be 'Provided by PrintMaster'
+		$window.Icon | Should Not BeNullOrEmpty
+		$window.Close()
+	}
+
+	It 'inherits application resources in both light and dark palettes' {
+		$resourceAssignment = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+			$node.Left.Extent.Text -eq '$script:themeResources'
+		}, $true)
+		foreach ($background in @('#002b36', '#fdf6e3')) {
+			$script:thBg = $background
+			. ([scriptblock]::Create($resourceAssignment.Extent.Text))
+			$window = New-ScanDialog -Title 'Theme Test' -Message 'Themed message'
+			$window.Background.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($background))
+			$window.FindName('btnAccept').Style | Should Not BeNullOrEmpty
+			$window.FindName('btnAccept').Background.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thAccent))
+			Assert-MockCalled Set-WindowTheme -Scope It -ParameterFilter { $window.Title -eq 'PrintMaster Scans - Theme Test' }
+			$window.Close()
+		}
+	}
+
+	It 'centers on an owner when supplied and on screen for startup failures' {
+		$ownerWindow = [System.Windows.Window]::new()
+		[System.Windows.Interop.WindowInteropHelper]::new($ownerWindow).EnsureHandle() | Out-Null
+		$owned = New-ScanDialog -Title 'Owned' -Owner $ownerWindow
+		$owned.Owner | Should Be $ownerWindow
+		$owned.WindowStartupLocation | Should Be ([System.Windows.WindowStartupLocation]::CenterOwner)
+		$unowned = New-ScanDialog -Title 'Startup'
+		$unowned.Owner | Should BeNullOrEmpty
+		$unowned.WindowStartupLocation | Should Be ([System.Windows.WindowStartupLocation]::CenterScreen)
+		$owned.Close()
+		$unowned.Close()
+		$ownerWindow.Close()
+	}
+
+	It 'defaults account confirmation to cancel and returns true only for explicit acceptance' {
+		$script:progressWindow = $null
+		$script:inspectDialog = {
+			param($window)
+			$window.FindName('btnAccept').IsDefault | Should Be $false
+			$window.FindName('btnCancel').IsDefault | Should Be $true
+			$window.FindName('btnCancel').IsCancel | Should Be $true
+			$window.FindName('btnAccept').Content | Should Be 'Change password'
+			$window.FindName('btnCancel').Content | Should Be 'Cancel setup'
+			$window.FindName('txtMessage').Text | Should Match "local account named 'scans'"
+			$window.FindName('txtMessage').Text | Should Match 'will change its password'
+		}
+		foreach ($accepted in @($true, $false, $null)) {
+			$script:dialogAccepted = $accepted
+			Confirm-ExistingScanAccountUpdate -Username scans | Should Be ($accepted -eq $true)
+		}
+	}
+
+	It 'shows error details and remediation without a cancel button or leaking a return value' {
+		$script:inspectDialog = {
+			param($window)
+			$window.FindName('txtMessage').Text | Should Be 'Access denied <example>'
+			$window.FindName('txtGuidance').Text | Should Match 'How to fix:'
+			$window.FindName('txtGuidance').Text | Should Match 'Try again as administrator'
+			$window.FindName('btnCancel').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
+		}
+		Show-ErrorPopup -Title 'Test Error' -Message 'Access denied <example>' -Remediation 'Try again as administrator' | Should BeNullOrEmpty
+	}
+
+	It 'accepts through the shared button handler without caller-specific wiring' {
+		Mock Set-WindowTheme { }
+		$window = New-ScanDialog -Title 'Button Test'
+		$window.WindowStartupLocation = 'Manual'
+		$window.Left = -32000
+		$window.Top = -32000
+		$window.ShowActivated = $false
+		$window.Add_ContentRendered({
+			$this.FindName('btnAccept').RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+		})
+		$window.ShowDialog() | Should Be $true
+	}
+
+	It 'never treats closing the dialog as consent' {
+		Mock Set-WindowTheme { }
+		$window = New-ScanDialog -Title 'Close Test' -DefaultCancel
+		$window.WindowStartupLocation = 'Manual'
+		$window.Left = -32000
+		$window.Top = -32000
+		$window.ShowActivated = $false
+		$window.Add_ContentRendered({ $this.Close() })
+		($window.ShowDialog() -eq $true) | Should Be $false
+	}
+
+	It 'initializes theme and icon before any preflight error can open a dialog' {
+		$source = Get-Content $sourcePath -Raw
+		$preflight = $source.IndexOf('$currentPrincipal =')
+		$source.IndexOf('$script:themeResources =') | Should BeLessThan $preflight
+		$source.IndexOf('function Set-WindowTheme') | Should BeLessThan $preflight
+		$source.IndexOf('function New-PrintMasterIcon') | Should BeLessThan $preflight
+		$source.IndexOf('$iconPath =') | Should BeGreaterThan $preflight
+	}
+}
+
 Describe 'Password correction dialog' {
 	BeforeEach {
 		Add-Type -AssemblyName PresentationFramework
@@ -907,9 +1031,9 @@ Describe 'Password correction dialog' {
 				$this.FindName('txtError').Text | Should Be 'Password policy rejected'
 				$this.FindName('txtPassword').Text | Should Be 'Rejected'
 				$this.FindName('txtPassword').Text = ''
-				$this.FindName('btnRetry').IsEnabled | Should Be $false
+				$this.FindName('btnAccept').IsEnabled | Should Be $false
 				$this.FindName('txtPassword').Text = 'ManualReplacement!'
-				$this.FindName('btnRetry').IsEnabled | Should Be $true
+				$this.FindName('btnAccept').IsEnabled | Should Be $true
 				$this.FindName('btnGenerate').RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 				$this.FindName('txtPassword').Text | Should Be 'GeneratedReplacement123!'
 				return $script:retryAccepted
@@ -930,6 +1054,19 @@ Describe 'Password correction dialog' {
 			$result = Show-PasswordRetryDialog -ErrorText 'Password policy rejected'
 			$result | Should BeNullOrEmpty
 		}
+	}
+
+	It 'starts with Retry disabled when the previous password is empty' {
+		$script:scanPass = ''
+		$script:retryAccepted = $false
+		Mock Set-WindowTheme {
+			$window | Add-Member ScriptMethod ShowDialog {
+				$this.FindName('txtPassword').Text | Should BeNullOrEmpty
+				$this.FindName('btnAccept').IsEnabled | Should Be $false
+				return $false
+			} -Force
+		}
+		Show-PasswordRetryDialog -ErrorText 'Password required' | Should BeNullOrEmpty
 	}
 }
 
@@ -956,7 +1093,7 @@ Describe 'Folder access review dialog' {
 			$window.FindName('txtRecipient').Text | Should Be 'DOMAIN\recipient'
 			$window.FindName('chkEveryone').IsChecked | Should Be $false
 			$window.FindName('txtPolicy').Text | Should Match 'inheritance will be disabled'
-			$window.FindName('btnApply').IsEnabled | Should Be $true
+			$window.FindName('btnAccept').IsEnabled | Should Be $true
 		}
 		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'DOMAIN\recipient' -ElevatedUser 'PC\admin'
 		$result.Recipient | Should Be 'DOMAIN\recipient'
@@ -969,11 +1106,11 @@ Describe 'Folder access review dialog' {
 			param($window)
 			$window.FindName('txtRecipient').Text | Should BeNullOrEmpty
 			$window.FindName('txtIdentity').Text | Should Match 'No desktop user was detected'
-			$window.FindName('btnApply').IsEnabled | Should Be $false
+			$window.FindName('btnAccept').IsEnabled | Should Be $false
 			$window.FindName('txtRecipient').Text = '   '
-			$window.FindName('btnApply').IsEnabled | Should Be $false
+			$window.FindName('btnAccept').IsEnabled | Should Be $false
 			$window.FindName('txtRecipient').Text = ' PC\recipient '
-			$window.FindName('btnApply').IsEnabled | Should Be $true
+			$window.FindName('btnAccept').IsEnabled | Should Be $true
 		}
 		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -ElevatedUser 'PC\admin'
 		$result.Recipient | Should Be 'PC\recipient'
@@ -1026,7 +1163,8 @@ Describe 'WPF window markup' {
 		$offset = (32 * 64 + 46) * 4
 		($pixels[$offset..($offset + 3)] -join ',') | Should Be '120,187,72,255'
 		$source = Get-Content $sourcePath -Raw
-		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 5
+		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 4
+		$source | Should Not Match '\[System\.Windows\.MessageBox\]::Show'
 		$source | Should Match "Initialize-DesktopShortcut -FolderPath .folderPath -IconPath .iconPath"
 		$source | Should Match '\[IO.File\]::WriteAllBytes\(\$iconPath, \[Convert\]::FromBase64String\(\$script:appIconBase64\)\)'
 	}
@@ -1065,7 +1203,7 @@ Describe 'WPF window markup' {
 	It 'loads setup and progress windows without displaying them or running setup' {
 		Add-Type -AssemblyName PresentationFramework
 		Initialize-TestTheme
-		foreach ($name in @('$script:themeResources', '$setupXaml', '$progressXaml', '$passwordRetryXaml')) {
+		foreach ($name in @('$script:themeResources', '$setupXaml', '$progressXaml', '$passwordRetryContent')) {
 			$assignment = $ast.Find({
 				param($node)
 				$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -1075,12 +1213,12 @@ Describe 'WPF window markup' {
 		}
 		$setup = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($setupXaml))
 		$progress = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($progressXaml))
-		$passwordRetry = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($passwordRetryXaml))
-		foreach ($name in @('txtError', 'txtRemediation', 'txtPassword', 'btnGenerate', 'btnRetry', 'btnCancel')) {
+		$passwordRetry = New-ScanDialog -Title 'Password Rejected' -ContentXaml $passwordRetryContent -AcceptText 'Retry' -CancelText 'Cancel setup'
+		foreach ($name in @('txtError', 'txtRemediation', 'txtPassword', 'btnGenerate', 'btnAccept', 'btnCancel')) {
 			$passwordRetry.FindName($name) | Should Not BeNullOrEmpty
 		}
 		$passwordRetry.FindName('btnCancel').IsCancel | Should Be $true
-		$passwordRetry.FindName('btnRetry').IsDefault | Should Be $true
+		$passwordRetry.FindName('btnAccept').IsDefault | Should Be $true
 		foreach ($window in @($setup, $progress)) {
 			$window.Icon = New-PrintMasterIcon
 			$window.Icon | Should Not BeNullOrEmpty

@@ -14,7 +14,94 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName PresentationFramework
 $ProgressPreference = 'SilentlyContinue'
 
-# --- Error popup helper ---
+function New-ScanDialog {
+	param(
+		[string]$Title,
+		[string]$Message,
+		[string]$Guidance,
+		[string]$ContentXaml,
+		[string]$AcceptText = 'OK',
+		[string]$CancelText = 'Cancel',
+		[double]$Width = 520,
+		[switch]$HideCancel,
+		[switch]$DefaultCancel,
+		$Owner
+	)
+
+	# Only source-owned markup belongs in ContentXaml. Runtime/user text is
+	# assigned to controls below so names, errors, and paths cannot become XAML.
+	[xml]$dialogXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        SizeToContent="Height" MaxHeight="780" ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen" ShowInTaskbar="False"
+        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
+$($script:themeResources)
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <TextBlock Name="txtMessage" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                <TextBlock Name="txtGuidance" TextWrapping="Wrap" Margin="0,0,0,12"/>
+                $ContentXaml
+            </StackPanel>
+        </ScrollViewer>
+        <DockPanel Grid.Row="1" Margin="0,12,0,0" LastChildFill="False">
+            <TextBlock Name="txtProvider" Text="Provided by PrintMaster" FontSize="11" VerticalAlignment="Center"/>
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button Name="btnAccept" MinWidth="85" Height="28" IsDefault="True" Margin="8,0,0,0"/>
+                <Button Name="btnCancel" MinWidth="85" Height="28" IsCancel="True" Margin="8,0,0,0"/>
+            </StackPanel>
+        </DockPanel>
+    </Grid>
+</Window>
+"@
+	$window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+	$window.Title = "PrintMaster Scans - $Title"
+	$window.Width = $Width
+	$window.MinWidth = $Width
+	$window.Icon = New-PrintMasterIcon
+	if ($Owner) {
+		$window.Owner = $Owner
+		$window.WindowStartupLocation = 'CenterOwner'
+	}
+	foreach ($entry in @(@('txtMessage', $Message), @('txtGuidance', $Guidance))) {
+		$control = $window.FindName($entry[0])
+		$control.Text = $entry[1]
+		if ([string]::IsNullOrWhiteSpace($entry[1])) { $control.Visibility = 'Collapsed' }
+	}
+	$window.FindName('btnAccept').Content = $AcceptText
+	$window.FindName('btnCancel').Content = $CancelText
+	if ($HideCancel) { $window.FindName('btnCancel').Visibility = 'Collapsed' }
+	if ($DefaultCancel) {
+		$window.FindName('btnAccept').IsDefault = $false
+		$window.FindName('btnCancel').IsDefault = $true
+		$window.Add_ContentRendered({ $this.FindName('btnCancel').Focus() | Out-Null })
+	}
+	$window.FindName('btnAccept').Add_Click({
+		[System.Windows.Window]::GetWindow($this).DialogResult = $true
+	})
+	Set-WindowTheme $window
+	return $window
+}
+
+function Show-ScanMessage {
+	param(
+		[string]$Title,
+		[string]$Message,
+		[string]$Guidance,
+		[string]$AcceptText = 'OK',
+		[string]$CancelText = 'Cancel',
+		[switch]$Confirm,
+		$Owner
+	)
+
+	$window = New-ScanDialog -Title $Title -Message $Message -Guidance $Guidance -AcceptText $AcceptText -CancelText $CancelText -HideCancel:(-not $Confirm) -DefaultCancel:$Confirm -Owner $Owner
+	return $window.ShowDialog() -eq $true
+}
+
 function Show-ErrorPopup {
 	param(
 		[string]$Title,
@@ -22,13 +109,7 @@ function Show-ErrorPopup {
 		[string]$Remediation,
 		$Owner
 	)
-	$body = "$Message`n`nHow to fix:`n$Remediation"
-	if ($Owner) {
-		[System.Windows.MessageBox]::Show($Owner, $body, $Title, 'OK', 'Error') | Out-Null
-	}
-	else {
-		[System.Windows.MessageBox]::Show($body, $Title, 'OK', 'Error') | Out-Null
-	}
+	Show-ScanMessage -Title $Title -Message $Message -Guidance "How to fix:`n$Remediation" -Owner $Owner | Out-Null
 }
 
 function Show-ErrorAndExit {
@@ -50,46 +131,6 @@ $script:Remediation = @{
 	AccessDenied   = "The current user does not have permission. Ensure you are running as Administrator and the folder is not read-only."
 	ShareInUse     = "Close any open files or Explorer windows pointing to the share, then try again."
 	PasswordPolicy = "Use Generate or enter a longer password with uppercase and lowercase letters, numbers, and symbols, then retry. Avoid including the username.`nLocal or domain Group Policy can enforce minimum length, complexity, password history, or additional restrictions. The generated password is not guaranteed to meet every policy. If it is still rejected, ask your administrator for the effective password requirements; do not disable the policy."
-}
-
-# --- Preflight checks ---
-# 1. Require Administrator
-$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-	try {
-		# When run via irm|iex $PSCommandPath is empty; dump ourselves to temp and re-launch elevated
-		$scriptPath = $PSCommandPath
-		if (-not $scriptPath) {
-			$scriptDir = Join-Path $env:TEMP "scans_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
-			[IO.Directory]::CreateDirectory($scriptDir) | Out-Null
-			$scriptPath = Join-Path $scriptDir 'scans.ps1'
-			$scriptBody = $MyInvocation.MyCommand.ScriptBlock.ToString()
-			if (-not $scriptBody) { throw 'Could not capture script content for elevation.' }
-			[IO.File]::WriteAllText($scriptPath, $scriptBody, [Text.Encoding]::UTF8)
-		}
-		Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Elevated" -Verb RunAs
-	} catch {
-		Show-ErrorAndExit -Title 'Administrator Required' `
-			-Message "This script must be run as Administrator to create users, shares, and configure network settings.`n`n$($_.Exception.Message)" `
-			-Remediation $script:Remediation.NotAdmin
-	}
-	return
-}
-
-# If we self-elevated, hide the console window — the WPF GUI is the only UI the user needs
-if ($Elevated) {
-	Add-Type -Name ConsoleWindow -Namespace Win32 -MemberDefinition @'
-[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-'@ -ErrorAction SilentlyContinue
-	try { [Win32.ConsoleWindow]::ShowWindow([Win32.ConsoleWindow]::GetConsoleWindow(), 0) | Out-Null } catch { }
-}
-
-# 2. Require PowerShell 5.1+
-if ($PSVersionTable.PSVersion -lt [version]'5.1') {
-	Show-ErrorAndExit -Title 'PowerShell Version Too Old' `
-		-Message "This script requires Windows PowerShell 5.1 or PowerShell 7. You are running $($PSVersionTable.PSVersion)." `
-		-Remediation $script:Remediation.OldPowerShell
 }
 
 # Detect OS capabilities for legacy fallback
@@ -247,6 +288,67 @@ function Set-WindowTheme($window) {
 	})
 }
 
+function New-PrintMasterIcon {
+	# WPF cannot load SVG directly; embed the site logo as vector artwork.
+	[xml]$logoXaml = @'
+<DrawingImage xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+    <DrawingImage.Drawing>
+        <DrawingGroup>
+            <GeometryDrawing Brush="Transparent"><GeometryDrawing.Geometry><RectangleGeometry Rect="0,0,64,64"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#4a5568"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,8,32,12" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#718096"><GeometryDrawing.Geometry><RectangleGeometry Rect="12,20,40,24" RadiusX="3" RadiusY="3"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#cbd5e0"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,24,32,16" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#4299e1" Geometry="M20,28 H28 V30 H20 Z M20,32 H32 V34 H20 Z M20,36 H30 V38 H20 Z"/>
+            <GeometryDrawing Brush="#48bb78"><GeometryDrawing.Geometry><EllipseGeometry Center="46,32" RadiusX="3" RadiusY="3"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#4a5568"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,44,32,12" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
+            <GeometryDrawing Brush="#e2e8f0"><GeometryDrawing.Geometry><RectangleGeometry Rect="20,48,24,4"/></GeometryDrawing.Geometry></GeometryDrawing>
+        </DrawingGroup>
+    </DrawingImage.Drawing>
+</DrawingImage>
+'@
+	$icon = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($logoXaml))
+	$icon.Freeze()
+	return $icon
+}
+
+# Initialize branding and theme before preflight so startup errors use the same dialog.
+$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+	try {
+		# When run via irm|iex $PSCommandPath is empty; dump ourselves to temp and re-launch elevated.
+		$scriptPath = $PSCommandPath
+		if (-not $scriptPath) {
+			$scriptDir = Join-Path $env:TEMP "scans_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+			[IO.Directory]::CreateDirectory($scriptDir) | Out-Null
+			$scriptPath = Join-Path $scriptDir 'scans.ps1'
+			$scriptBody = $MyInvocation.MyCommand.ScriptBlock.ToString()
+			if (-not $scriptBody) { throw 'Could not capture script content for elevation.' }
+			[IO.File]::WriteAllText($scriptPath, $scriptBody, [Text.Encoding]::UTF8)
+		}
+		Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Elevated" -Verb RunAs
+	} catch {
+		Show-ErrorAndExit -Title 'Administrator Required' `
+			-Message "This script must be run as Administrator to create users, shares, and configure network settings.`n`n$($_.Exception.Message)" `
+			-Remediation $script:Remediation.NotAdmin
+	}
+	return
+}
+
+# If we self-elevated, hide the console window.
+if ($Elevated) {
+	Add-Type -Name ConsoleWindow -Namespace Win32 -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction SilentlyContinue
+	try { [Win32.ConsoleWindow]::ShowWindow([Win32.ConsoleWindow]::GetConsoleWindow(), 0) | Out-Null } catch { }
+}
+
+if ($PSVersionTable.PSVersion -lt [version]'5.1') {
+	Show-ErrorAndExit -Title 'PowerShell Version Too Old' `
+		-Message "This script requires Windows PowerShell 5.1 or PowerShell 7. You are running $($PSVersionTable.PSVersion)." `
+		-Remediation $script:Remediation.OldPowerShell
+}
+
 $createUser = $true
 $hideUser = $true
 $createFolder = $true
@@ -298,23 +400,9 @@ function Confirm-ExistingScanAccountUpdate {
 
 	$message = "A local account named '$Username' already exists. Continuing will change its password and may affect anything that uses it. Continue only if this is the account you intend to use for scanning."
 	Write-Verbose "Requesting confirmation before changing the password for existing account '$Username'."
-	if ($script:progressWindow) {
-		return [System.Windows.MessageBox]::Show(
-			$script:progressWindow,
-			$message,
-			'Existing Account Password Change',
-			[System.Windows.MessageBoxButton]::YesNo,
-			[System.Windows.MessageBoxImage]::Warning,
-			[System.Windows.MessageBoxResult]::No
-		) -eq [System.Windows.MessageBoxResult]::Yes
-	}
-	return [System.Windows.MessageBox]::Show(
-		$message,
-		'Existing Account Password Change',
-		[System.Windows.MessageBoxButton]::YesNo,
-		[System.Windows.MessageBoxImage]::Warning,
-		[System.Windows.MessageBoxResult]::No
-	) -eq [System.Windows.MessageBoxResult]::Yes
+	return Show-ScanMessage -Title 'Existing Account Password Change' -Message $message `
+		-Guidance 'Cancel leaves the account unchanged and stops the remaining setup steps.' `
+		-AcceptText 'Change password' -CancelText 'Cancel setup' -Confirm -Owner $script:progressWindow
 }
 
 function Initialize-ScanUser {
@@ -517,14 +605,8 @@ function Show-ScanFolderAccessDialog {
 		[array]$CleanupRules
 	)
 
-	[xml]$folderAccessXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="PrintMaster Scans - Folder Access" Width="640" SizeToContent="Height" MaxHeight="780"
-        WindowStartupLocation="CenterOwner" ResizeMode="CanResize" ShowInTaskbar="False"
-        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
-$($script:themeResources)
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <StackPanel Margin="12">
+	$folderAccessContent = @'
+        <StackPanel>
             <TextBlock Name="txtFolder" TextWrapping="Wrap" Margin="0,0,0,8"/>
             <TextBlock Text="Scan account: list/read data, create/write files, create folders/append data. No explicit delete, execute, permission-change, or ownership grant. Windows also adds Synchronize." TextWrapping="Wrap" Margin="0,0,0,8"/>
             <TextBlock Name="txtIdentity" TextWrapping="Wrap" Margin="0,0,0,8"/>
@@ -538,18 +620,10 @@ $($script:themeResources)
                      VerticalScrollBarVisibility="Auto" Visibility="Collapsed" Margin="0,0,0,8"/>
             <StackPanel Name="pnlCleanup"/>
             <TextBlock Text="Read data can expose existing scans; write data can overwrite files. Some printers need extra rights; test your printer before using this destination." TextWrapping="Wrap" Margin="0,8,0,12"/>
-            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button Name="btnApply" Content="Apply permissions" Width="140" Height="24" IsDefault="True" Margin="0,0,8,0"/>
-                <Button Name="btnCancel" Content="Cancel folder setup" Width="140" Height="24" IsCancel="True"/>
-            </StackPanel>
         </StackPanel>
-    </ScrollViewer>
-</Window>
-"@
-	$window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($folderAccessXaml))
-	if ($script:progressWindow) { $window.Owner = $script:progressWindow }
-	$window.Icon = New-PrintMasterIcon
-	Set-WindowTheme $window
+'@
+	$window = New-ScanDialog -Title 'Folder Access' -ContentXaml $folderAccessContent -Width 680 `
+		-AcceptText 'Apply permissions' -CancelText 'Cancel folder setup' -Owner $script:progressWindow
 	$window.FindName('txtFolder').Text = "Review folder access: $FolderPath"
 	$window.FindName('txtRecipient').Text = $DesktopUser
 	$identityText = "Desktop user: $DesktopUser. Elevated account: $ElevatedUser."
@@ -585,11 +659,10 @@ $($script:themeResources)
 			$cleanupBoxes += $box
 		}
 	}
-	$window.FindName('btnApply').IsEnabled = -not [string]::IsNullOrWhiteSpace($DesktopUser)
+	$window.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($DesktopUser)
 	$window.FindName('txtRecipient').Add_TextChanged({
-		$window.FindName('btnApply').IsEnabled = -not [string]::IsNullOrWhiteSpace($window.FindName('txtRecipient').Text)
+		$window.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($window.FindName('txtRecipient').Text)
 	})
-	$window.FindName('btnApply').Add_Click({ $window.DialogResult = $true })
 	if ($window.ShowDialog() -eq $true) {
 		return @{
 			Recipient = $window.FindName('txtRecipient').Text.Trim()
@@ -855,29 +928,6 @@ $iconPath = 'C:\ProgramData\scans.ico'
 if (!(Test-Path $iconPath)) {
 	[IO.File]::WriteAllBytes($iconPath, [Convert]::FromBase64String($script:appIconBase64))
 }
-function New-PrintMasterIcon {
-	# WPF cannot load SVG directly; embed the site logo as vector artwork.
-	[xml]$logoXaml = @'
-<DrawingImage xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
-    <DrawingImage.Drawing>
-        <DrawingGroup>
-            <GeometryDrawing Brush="Transparent"><GeometryDrawing.Geometry><RectangleGeometry Rect="0,0,64,64"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#4a5568"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,8,32,12" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#718096"><GeometryDrawing.Geometry><RectangleGeometry Rect="12,20,40,24" RadiusX="3" RadiusY="3"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#cbd5e0"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,24,32,16" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#4299e1" Geometry="M20,28 H28 V30 H20 Z M20,32 H32 V34 H20 Z M20,36 H30 V38 H20 Z"/>
-            <GeometryDrawing Brush="#48bb78"><GeometryDrawing.Geometry><EllipseGeometry Center="46,32" RadiusX="3" RadiusY="3"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#4a5568"><GeometryDrawing.Geometry><RectangleGeometry Rect="16,44,32,12" RadiusX="2" RadiusY="2"/></GeometryDrawing.Geometry></GeometryDrawing>
-            <GeometryDrawing Brush="#e2e8f0"><GeometryDrawing.Geometry><RectangleGeometry Rect="20,48,24,4"/></GeometryDrawing.Geometry></GeometryDrawing>
-        </DrawingGroup>
-    </DrawingImage.Drawing>
-</DrawingImage>
-'@
-	$icon = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($logoXaml))
-	$icon.Freeze()
-	return $icon
-}
-
 # --- Embedded settings gear icon (base64 PNG, theme-aware via OpacityMask) ---
 $script:settingsIconBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAGAAAABkCAQAAADTAP2lAAAAxHpUWHRSYXcgcHJvZmlsZSB0eXBlIGV4aWYAAHjabVDbEcMgDPtnio4AlkPscUiT3nWDjl+DnV5oqzvkhxJhnI7X85FuHVQ48bJK1VqzgZWVmiWSHW1wyTx4oIZk9dRPlUMga8EivJT4o5z98jHw0CxbLkZyD2GbBY0LSL6MyAP6RD3fw0jDCORCCYPW4ikq6/UJ25FniJ/UiWUe+6debXv7YveA6EBBNgaqD4B+OKFZAmOC2ocZOjpszDjNbCH/9nQivQHrcFkdUfZFZgAAASNpQ0NQSUNDIHByb2ZpbGUAAHicnZC/SsNQFMZ/aUVF7KQ4iEIG1y6CmRz8h8GhUNMIRqc0abGYxJCkFN/AN9GH6SAIPoOzgrPfjQ4OZvHCyffjcM733Rto2UmUlgsHkGZV4XqHwWVwZS+90Wabjr67YVTmvcGpT+P5fMUy+tI1Xs1zf57FeFRG0rkqi/KiAmtf7Myq3LCK9VvfOxY/iO04zWLxk3gnTmPDZtdLk2n042luszrKLgamr9rC5YwefWyGTJmQUNGVZuqc4LAndSkIuackkiaM1JtppuJGVMrJ5Ujki3SbhrzNOq+vlKE8JvIyCXek8jR5mP/7vfZxXm9aG/M8LMK61Va1xmN4f4ROAGvPsHLdkLX8+20NM0498883fgEty1CH2lf0fwAADXZpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+Cjx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IlhNUCBDb3JlIDQuNC4wLUV4aXYyIj4KIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIKICAgIHhtbG5zOnhtcE1NPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvbW0vIgogICAgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyIKICAgIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIKICAgIHhtbG5zOkdJTVA9Imh0dHA6Ly93d3cuZ2ltcC5vcmcveG1wLyIKICAgIHhtbG5zOnRpZmY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vdGlmZi8xLjAvIgogICAgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIgogICB4bXBNTTpEb2N1bWVudElEPSJnaW1wOmRvY2lkOmdpbXA6NmZhZmE1Y2EtN2VhNy00YTA1LTgzODAtZTM4M2UyMTZhOGZjIgogICB4bXBNTTpJbnN0YW5jZUlEPSJ4bXAuaWlkOmU0NDU3ODRmLTkyNTktNDc3Ny05YWI5LTg3OWU2ZWNjMGMzOSIKICAgeG1wTU06T3JpZ2luYWxEb2N1bWVudElEPSJ4bXAuZGlkOmFiYjc3ZGRiLTYyYmQtNGQ5Yi1iYzViLTk4YTBmM2VlZWY5NCIKICAgZGM6Rm9ybWF0PSJpbWFnZS9wbmciCiAgIEdJTVA6QVBJPSIyLjAiCiAgIEdJTVA6UGxhdGZvcm09IldpbmRvd3MiCiAgIEdJTVA6VGltZVN0YW1wPSIxNzExNzE3NDgwNTk0NDgyIgogICBHSU1QOlZlcnNpb249IjIuMTAuMzYiCiAgIHRpZmY6T3JpZW50YXRpb249IjEiCiAgIHhtcDpDcmVhdG9yVG9vbD0iR0lNUCAyLjEwIgogICB4bXA6TWV0YWRhdGFEYXRlPSIyMDI0OjAzOjI5VDA5OjA0OjQwLTA0OjAwIgogICB4bXA6TW9kaWZ5RGF0ZT0iMjAyNDowMzoyOVQwOTowNDo0MC0wNDowMCI+CiAgIDx4bXBNTTpIaXN0b3J5PgogICAgPHJkZjpTZXE+CiAgICAgPHJkZjpsaQogICAgICBzdEV2dDphY3Rpb249InNhdmVkIgogICAgICBzdEV2dDpjaGFuZ2VkPSIvIgogICAgICBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjc5NjdmN2QxLTUyMTgtNDM5Ni05NTUwLTVkN2M1YzJmMmExNiIKICAgICAgc3RFdnQ6c29mdHdhcmVBZ2VudD0iR2ltcCAyLjEwIChXaW5kb3dzKSIKICAgICAgc3RFdnQ6d2hlbj0iMjAyNC0wMy0yOVQwOTowNDo0MCIvPgogICAgPC9yZGY6U2VxPgogICA8L3htcE1NOkhpc3Rvcnk+CiAgPC9yZGY6RGVzY3JpcHRpb24+CiA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgCjw/eHBhY2tldCBlbmQ9InciPz6lj/qJAAAAAmJLR0QA/4ePzL8AAAAJcEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfoAx0NBCiKEThwAAAG8UlEQVR42t2cW2xURRjHf3NWqFRku1yUFQI7FDAUtSUUUzRoQghaUBNijbQ18fIgJj4IvEhifDDRxBdvqAnqA77QaqzRoIJBokGUNlqQgiVcusxK0IKI3XJptbp7fEBkl57dnplzSs/xe9yd75v5z3wz893mCHwjaXEdFcxhJtOYzESilDIKwQD99PIb3Ryji4N08qvK+tWr8EdMwhKreZLpRFw0zvATb9qvpnwBEfEHQOwJ1hPDctXYIsZd4mS6PTArIGEP8zSZ9jBf+dC35csClDJbm2c2pQQGQDnXaPOMZUZwANxsxHVLcABUGXFVBgSANAVQJYMBwLZMVci2AgFAxJlkxDhJxIOxByoMr8MIFcEAUDkCnP4BSJhuYYCqxMgDEJ4AeLdkrnKeVSGppZ/P6R7SXol6uFFnEKV3yEM6zt2MYautUu4ARBH30Uwp8CdfyiY+obcIjGWMMQYwhlreKzL0KPfSwGJKgD5RH9vc48YalTV8wdicH87wGZvs7fw5eAbktbQbGHKX6BAL1FmHfVUiltDIcsbl/HyeJaptSAByGq3c4NDVST6kiTaVyWk7jmaWeVTiLdSrMzkyI9TQwP1c79D2FxaqY0UByKv5iprCly5J3ucDDpBlPPfwDOU+HMNJXuATerCo4AEepLyIl9LKYvVHQQASXuWpoW0HzvEHMecDwJD+pocSrnXhYL3GauUMQJBYzmaf7NPhoyz3pT6znQDICXQwheDTcarU6UFOvYTXuZMw0DgmlG1OD7qJF/EoYaFHxKLLVEhGaGUB4aF2ai4c6BdXoD5Uw4dqGnJWQI6mk5mEi7qYqwYurkBj6IYPM2n8dwVkhA7mEj7qtCtTGQtYGsrhw1yxFCwJqwgrPSERcgqKUSEF8BfSYmVohw+jWGlRR5ipTsized6XfzbjIdpJ0gPEKKea2X4lU/Lo3FXsZ6HPQn/hLZpIKjvH0hXMoJFVjr6eF9ovZA1bKfNNYD8v8rI6V8BNH8ta1nkIAlxOaWrFFEbfwkf+JBs4zIPsVcWDJFW87ykMcImOsmJg3wVbaDIt3O6DhbhMnRq6mZzEFqo99/YtderEv7aQOsFSNnkUeMjd8EGdYhmHPfa2iaXqRI5Hlv6r7GNhc4dx1rKPu5XrpGO6L/Y1DxvfP1mes9ekBi5zKdN2bAdHqDUU+xwtaY3mZSeFxWLDqXqEN1J2obDKQj5EP+1wnBtVnx6LvIaDTNXuqZv7ac1d6rwgiiLVym10aIvdYPfpstjn2aDdTwe3p1rzNdUpNhqlmVoNsRnK1U/6uiCnk9S6nbfQoAbFsh3CWKqXOr7XEHyAY0bafIwDGq2/o045hOId43CqjzXYrkXv1mibp0Xs1mi7VvU7/VEokLiLLtfCk2ZFGwqSrhsfYZfzHwUAKJv9roX/bnwduefcr2wtAGCoFlecCgBICI3s+3jj3t1z3pwQWgDEQma5Fl5uVvOQQCM9MkvcpgFAjuEVDatovpkFJYSGTSp4RZa6BCCjtHCrxkgqmGa0BNOZo9F6AS0yOiQAgUywQzNxF+GhhIkCNWp6ybXskFIMWpr/jzEnoZ7tmJTATGVNQlN7WGMwfIiznXqZt/wXl9QSz7Ke0YYHYo34NH1S4/ys5F1Dz2MUKxBlO9N2ngrJUt6+EK724FIucudSgpzENx4d+008fkFpR8Kpv44tzPfLqQ99WCUyscZw4zrRBB4mEtudHigY2FrHRib71FuM+sgOIXddodBiOQ3DEFpsHa7gbobD/wV3x1NONbOGJ7grZGuR6pTgU5tFC2GmFiGncjTEKaYZFsfZGtr538pxS2EQYAoKbVBYwDY6Qzn8TraBBSrDS6EE8JLK/A+KPSIA6UwszYqQAVitfsh1aJpoD9Xw22nK88hUhrVkQzP8LGsvFuBecil3sjE0ADay08GpD03Z5c9UXiq7zHHqU6dZFQI1yrIqddrBqQeIHWG8C9vU5ixnKPG1xvdvTpNhtIsY3+us73EOq4CCdbQVHXoXLzCPicSJ85hGDqEYJXmMOHEmMo/n6SoaF2/j6SFyZCEvv4dCDyDYbjs/gPieGz2FAaqdHkCIEpbQwD0GDyCgjFjOExSGeIIiV9LsAUCDai4Swch7gkJ97+bBKR3HTaPzCEhG6TYuoOknrjw+AvL8DkrCj8Zlm53c5PVVt+ej0Ia9xsx7vSfiPANIeQKQGnkAYFBb4Z3TVwAHyBjxZbRKDYYPgN3NKSPGU3Z3IACIrEZWP5f2iWwgACjTbbw3OB/G6BipLewXgH1XkGtYACQ5r81zjqPBAdBnUAd6mL7AAFDwjjbTO8qXufPr+0J7OMMsxrmakAwpnufNtC8VST594Qku+0RVnAlX5hNV/wDkVh2zQRBX5QAAAABJRU5ErkJggg=='
 $script:settingsIconBitmap = $null
@@ -1083,7 +1133,7 @@ $script:progressWindow.FindName('btnCopyPassword').Add_Click({
 		[System.Windows.Forms.Clipboard]::SetText($scanPass)
 	}
 	Write-Verbose "Copied scan password to clipboard"
-	[System.Windows.MessageBox]::Show('Password has been copied to Clipboard')
+	Show-ScanMessage -Title 'Password Copied' -Message 'Password has been copied to Clipboard' -Owner $script:progressWindow | Out-Null
 })
 
 $script:progressWindow.FindName('btnDone').Add_Click({
@@ -1139,13 +1189,8 @@ function Show-StepResult($result) {
 function Show-PasswordRetryDialog {
 	param([string]$ErrorText)
 
-	[xml]$passwordRetryXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="PrintMaster Scans - Password Rejected" Width="480" SizeToContent="Height"
-        WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False"
-        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
-$($script:themeResources)
-    <StackPanel Margin="12">
+	$passwordRetryContent = @'
+    <StackPanel>
         <TextBlock Text="Windows rejected the scan-account password. Setup is paused." TextWrapping="Wrap" Margin="0,0,0,8"/>
         <TextBlock Name="txtError" TextWrapping="Wrap" Margin="0,0,0,8"/>
         <TextBlock Name="txtRemediation" TextWrapping="Wrap" Margin="0,0,0,12"/>
@@ -1155,27 +1200,20 @@ $($script:themeResources)
             <TextBox Name="txtPassword"/>
         </DockPanel>
         <TextBlock Text="Retry resumes account setup before any remaining steps. Cancel stops setup." TextWrapping="Wrap" Margin="0,0,0,12"/>
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnRetry" Content="Retry" Width="75" Height="24" IsDefault="True" Margin="0,0,8,0"/>
-            <Button Name="btnCancel" Content="Cancel setup" Width="100" Height="24" IsCancel="True"/>
-        </StackPanel>
     </StackPanel>
-</Window>
-"@
-	$passwordWindow = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($passwordRetryXaml))
-	$passwordWindow.Owner = $script:progressWindow
-	$passwordWindow.Icon = New-PrintMasterIcon
-	Set-WindowTheme $passwordWindow
+'@
+	$passwordWindow = New-ScanDialog -Title 'Password Rejected' -ContentXaml $passwordRetryContent `
+		-AcceptText 'Retry' -CancelText 'Cancel setup' -Owner $script:progressWindow
 	$passwordWindow.FindName('txtError').Text = $ErrorText
 	$passwordWindow.FindName('txtRemediation').Text = $script:Remediation.PasswordPolicy
 	$passwordWindow.FindName('txtPassword').Add_TextChanged({
-		$passwordWindow.FindName('btnRetry').IsEnabled = -not [string]::IsNullOrWhiteSpace($passwordWindow.FindName('txtPassword').Text)
+		$passwordWindow.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($passwordWindow.FindName('txtPassword').Text)
 	})
 	$passwordWindow.FindName('txtPassword').Text = $script:scanPass
+	$passwordWindow.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($script:scanPass)
 	$passwordWindow.FindName('btnGenerate').Add_Click({
 		$passwordWindow.FindName('txtPassword').Text = New-RandomPassword
 	})
-	$passwordWindow.FindName('btnRetry').Add_Click({ $passwordWindow.DialogResult = $true })
 	if ($passwordWindow.ShowDialog() -eq $true) {
 		return $passwordWindow.FindName('txtPassword').Text
 	}
