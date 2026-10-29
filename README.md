@@ -103,6 +103,8 @@ Development builds on `main` use a shared Solarized light/dark dialog shell for 
 
 Existing-account confirmation offers **Change password** and **Cancel setup**, with Cancel as the keyboard default. Closing the window or pressing Escape is not consent. The same shell hosts text fields and custom actions: folder access keeps its recipient field, and password retry retains **Generate**, blank-input validation, **Retry**, and **Cancel setup**.
 
+Shared dialog footers place an outlined, neutral **Cancel** to the left of the filled, emphasized approval action at the far right. Folder/share permission confirmations initially focus Cancel and do not default Enter to approval. Their permission tables keep themed, readable full-row hover and selection states, including when keyboard focus moves elsewhere; a border distinguishes selection and keyboard focus.
+
 This UI refactor does not implement password masking or secure-state changes. [Issue #29](https://github.com/Printmaster-Org/scans/issues/29) tracks generation, reveal controls, minimizing plaintext copies, command-argument exposure, logging safeguards, and clipboard cleanup. Until that work ships, passwords remain visible in entry fields and are held as strings before conversion for local-account cmdlets. Copying places the accepted secret on the clipboard; treat clipboard history/sync and screenshots as potential exposure.
 
 ### Folder access review (unreleased)
