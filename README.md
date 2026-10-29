@@ -131,6 +131,20 @@ Canceling the review or failing folder setup skips SMB share configuration and r
 
 Test a real scan before relying on the destination. Some printers require additional attributes, rename, or delete access; do not broaden permissions silently to make a test pass.
 
+### Existing SMB shares (unreleased)
+
+Development builds on `main` check the selected local folder and any existing share's path before changing share permissions. A conflicting name opens **Share name conflict**: choose another share name to check or cancel share setup. Scans never repoints, deletes, or recreates the conflicting share. Use the actual share name reported in the progress details for printer configuration.
+
+New shares grant **Change**, not Full, to the explicitly qualified local scan account. This is the SMB permission layer; the folder's NTFS ACL still limits actual file operations. No Everyone share grant is added.
+
+For an existing share pointing to the selected folder, **Review SMB share access** shows resolved account names, Allow/Deny entries, and Read/Change/Full rights. The warning counts other-account grants, scan-account Full grants, and Deny entries. Existing access is preserved unless you explicitly select individual **Remove** checkboxes, all unchecked initially. Deny entries are never removed. When several Allow entries resolve to the same principal, removal is unavailable because Windows' revoke command would remove all of them. Review such ACLs in Windows.
+
+**Apply share access** adds Change only if the scan account does not already have Change or Full. Existing scan Full is retained unless you select its removal; selecting it replaces Full with Change. Other selected Allow grants are removed without resetting the share ACL. Preserved group grants can still give broader access, and Deny entries can still block scanning; this is not an effective-access calculation.
+
+Cancel, Escape, or closing a review makes no share changes. Scans rechecks the share path, scope, and ACL after review and stops if they changed. This is a best-effort concurrency check, not an atomic lock against other administrators. Special/scoped or unreadable shares are refused rather than guessed. If a later write fails, progress details report successful partial changes; no automatic rollback is attempted. Earlier account/folder work is not rolled back, and independent selected steps can continue.
+
+Without SMB cmdlets, Scans uses structured WMI lookup and a create-only WMI operation with an explicit Change ACL for new shares. It refuses to edit existing shares in this mode; configure them in Windows or rerun with SMB cmdlets. Lookup failures are errors, never evidence that a share is absent. Validate both normal and legacy paths on a disposable VM and test real printer delivery before release.
+
 ### Password policy errors
 
 Windows can reject a scan-account password that does not meet the effective local or domain Group Policy requirements, even for a local account. A short, lowercase-only password may fail minimum-length or complexity rules.
@@ -183,7 +197,7 @@ pwsh.exe -NoProfile -STA -File .\tests\Invoke-Tests.ps1
 node --test .\tests\site.test.cjs .\tests\embed.test.cjs
 ```
 
-The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded but never displayed. Tests cover password failures, error-popup routing, account visibility, folder setup, shares, network configuration, shortcuts, generated password shape, and setup options. The generator tests do not claim that every generated password satisfies policy.
+The [test runner](tests/Invoke-Tests.ps1) fails on syntax errors, failing tests, or an empty test run. The [regression suite](tests/Scans.Tests.ps1) extracts function definitions without running the utility's elevation or setup code. Account, registry, filesystem, SMB, firewall, clipboard-related setup gating, and COM changes are mocked; WPF windows are loaded and selected binding tests render off-screen. Legacy share tests construct real in-memory CIM security descriptors but mock the machine-changing calls. Tests cover password failures, error-popup routing, account visibility, folder setup, share conflicts/reviews/partial failures, network configuration, shortcuts, generated password shape, and setup options. The generator tests do not claim that every generated password satisfies policy.
 
 The [release tests](tests/Releases.Tests.ps1) cover loader selection, verification failures, temporary-file cleanup, package integrity, and site generation. Site rendering tests use Node's built-in test runner with no additional dependencies.
 
