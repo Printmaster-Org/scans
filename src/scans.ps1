@@ -130,7 +130,7 @@ $script:Remediation = @{
 	TrustRelation  = "The domain trust is broken. Run the following from an admin prompt:`nTest-ComputerSecureChannel -Repair -Credential (Get-Credential)`nOr rejoin the machine to the domain."
 	AccessDenied   = "The current user does not have permission. Ensure you are running as Administrator and the folder is not read-only."
 	ShareInUse     = "Close any open files or Explorer windows pointing to the share, then try again."
-	PasswordPolicy = "Use Generate or enter a longer password with uppercase and lowercase letters, numbers, and symbols, then retry. Avoid including the username.`nLocal or domain Group Policy can enforce minimum length, complexity, password history, or additional restrictions. The generated password is not guaranteed to meet every policy. If it is still rejected, ask your administrator for the effective password requirements; do not disable the policy."
+	PasswordPolicy = "Use Generate for a new passphrase, or enter a longer password with uppercase and lowercase letters, numbers, and symbols, then retry. Length matters most. Avoid including the username.`nLocal or domain Group Policy can enforce minimum length, complexity, password history, or additional restrictions. The generated password is not guaranteed to meet every policy. If it is still rejected, ask your administrator for the effective password requirements; do not disable the policy."
 }
 
 # Detect OS capabilities for legacy fallback
@@ -430,15 +430,144 @@ $checkNetworkSettings = $true
 # Network Discovery is not needed for SMB scan-to-folder; enable only on request.
 $enableNetworkDiscovery = $false
 
-function New-RandomPassword {
-	param([int]$Length = 10)
-	$chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*+-=?'
-	$rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
-	$bytes = [byte[]]::new($Length)
-	$rng.GetBytes($bytes)
-	$result = -join ((0..($Length - 1)) | ForEach-Object { $chars[[int]($bytes[$_] % $chars.Length)] })
-	$rng.Dispose()
-	return $result
+function Get-ScanPassphraseWordList {
+	# EFF Short Wordlist 1 (https://www.eff.org/dice), licensed CC BY 3.0 US
+	# (https://creativecommons.org/licenses/by/3.0/us/). Modified: removed
+	# "yo-yo" so hyphens only separate words, and "scan"/"user" so generated
+	# passphrases do not resemble the scan account name. 1,293 words remain.
+	# Embedded because releases ship as one hash-verified script.
+	return @(@'
+acid acorn acre acts afar affix aged agent agile aging agony ahead aide aids aim ajar
+alarm alias alibi alien alike alive aloe aloft aloha alone amend amino ample amuse angel anger
+angle ankle apple april apron aqua area arena argue arise armed armor army aroma array arson
+art ashen ashes atlas atom attic audio avert avoid awake award awoke axis bacon badge bagel
+baggy baked baker balmy banjo barge barn bash basil bask batch bath baton bats blade blank
+blast blaze bleak blend bless blimp blink bloat blob blog blot blunt blurt blush boast boat
+body boil bok bolt boned boney bonus bony book booth boots boss botch both boxer breed
+bribe brick bride brim bring brink brisk broad broil broke brook broom brush buck bud buggy
+bulge bulk bully bunch bunny bunt bush bust busy buzz cable cache cadet cage cake calm
+cameo canal candy cane canon cape card cargo carol carry carve case cash cause cedar chain
+chair chant chaos charm chase cheek cheer chef chess chest chew chief chili chill chip chomp
+chop chow chuck chump chunk churn chute cider cinch city civic civil clad claim clamp clap
+clash clasp class claw clay clean clear cleat cleft clerk click cling clink clip cloak clock
+clone cloth cloud clump coach coast coat cod coil coke cola cold colt coma come comic
+comma cone cope copy coral cork cost cot couch cough cover cozy craft cramp crane crank
+crate crave crawl crazy creme crepe crept crib cried crisp crook crop cross crowd crown crumb
+crush crust cub cult cupid cure curl curry curse curve curvy cushy cut cycle dab dad
+daily dairy daisy dance dandy darn dart dash data date dawn deaf deal dean debit debt
+debug decaf decal decay deck decor decoy deed delay denim dense dent depth derby desk dial
+diary dice dig dill dime dimly diner dingy disco dish disk ditch ditzy dizzy dock dodge
+doing doll dome donor donut dose dot dove down dowry doze drab drama drank draw dress
+dried drift drill drive drone droop drove drown drum dry duck duct dude dug duke duo
+dusk dust duty dwarf dwell eagle early earth easel east eaten eats ebay ebony ebook echo
+edge eel eject elbow elder elf elk elm elope elude elves email emit empty emu enter
+entry envoy equal erase error erupt essay etch evade even evict evil evoke exact exit fable
+faced fact fade fall false fancy fang fax feast feed femur fence fend ferry fetal fetch
+fever fiber fifth fifty film filth final finch fit five flag flaky flame flap flask fled
+flick fling flint flip flirt float flock flop floss flyer foam foe fog foil folic folk
+food fool found fox foyer frail frame fray fresh fried frill frisk from front frost froth
+frown froze fruit gag gains gala game gap gas gave gear gecko geek gem genre gift
+gig gills given giver glad glass glide gloss glove glow glue goal going golf gong good
+gooey goofy gore gown grab grain grant grape graph grasp grass grave gravy gray green greet
+grew grid grief grill grip grit groom grope growl grub grunt guide gulf gulp gummy guru
+gush gut guy habit half halo halt happy harm hash hasty hatch hate haven hazel hazy
+heap heat heave hedge hefty help herbs hers hub hug hula hull human humid hump hung
+hunk hunt hurry hurt hush hut ice icing icon icy igloo image ion iron islam issue
+item ivory ivy jab jam jaws jazz jeep jelly jet jiffy job jog jolly jolt jot
+joy judge juice juicy july jumbo jump junky juror jury keep keg kept kick kilt king
+kite kitty kiwi knee knelt koala kung ladle lady lair lake lance land lapel large lash
+lasso last latch late lazy left legal lemon lend lens lent level lever lid life lift
+lilac lily limb limes line lint lion lip list lived liver lunar lunch lung lurch lure
+lurk lying lyric mace maker malt mama mango manor many map march mardi marry mash match
+mate math moan mocha moist mold mom moody mop morse most motor motto mount mouse mousy
+mouth move movie mower mud mug mulch mule mull mumbo mummy mural muse music musky mute
+nacho nag nail name nanny nap navy near neat neon nerd nest net next niece ninth
+nutty oak oasis oat ocean oil old olive omen onion only ooze opal open opera opt
+otter ouch ounce outer oval oven owl ozone pace pagan pager palm panda panic pants panty
+paper park party pasta patch path patio payer pecan penny pep perch perky perm pest petal
+petri petty photo plank plant plaza plead plot plow pluck plug plus poach pod poem poet
+pogo point poise poker polar polio polka polo pond pony poppy pork poser pouch pound pout
+power prank press print prior prism prize probe prong proof props prude prune pry pug pull
+pulp pulse puma punch punk pupil puppy purr purse push putt quack quake query quiet quill
+quilt quit quota quote rabid race rack radar radio raft rage raid rail rake rally ramp
+ranch range rank rant rash raven reach react ream rebel recap relax relay relic remix repay
+repel reply rerun reset rhyme rice rich ride rigid rigor rinse riot ripen rise risk ritzy
+rival river roast robe robin rock rogue roman romp rope rover royal ruby rug ruin rule
+runny rush rust rut sadly sage said saint salad salon salsa salt same sandy santa satin
+sauna saved savor sax say scale scam scare scarf scary scoff scold scoop scoot scope score
+scorn scout scowl scrap scrub scuba scuff sect sedan self send sepia serve set seven shack
+shade shady shaft shaky sham shape share sharp shed sheep sheet shelf shell shine shiny ship
+shirt shock shop shore shout shove shown showy shred shrug shun shush shut shy sift silk
+silly silo sip siren sixth size skate skew skid skier skies skip skirt skit sky slab
+slack slain slam slang slash slate slaw sled sleek sleep sleet slept slice slick slimy sling
+slip slit slob slot slug slum slurp slush small smash smell smile smirk smog snack snap
+snare snarl sneak sneer sniff snore snort snout snowy snub snuff speak speed spend spent spew
+spied spill spiny spoil spoke spoof spool spoon sport spot spout spray spree spur squad squat
+squid stack staff stage stain stall stamp stand stank stark start stash state stays steam steep
+stem step stew stick sting stir stock stole stomp stony stood stool stoop stop storm stout
+stove straw stray strut stuck stud stuff stump stung stunt suds sugar sulk surf sushi swab
+swan swarm sway swear sweat sweep swell swept swim swing swipe swirl swoop swore syrup tacky
+taco tag take tall talon tamer tank taper taps tarot tart task taste tasty taunt thank
+thaw theft theme thigh thing think thong thorn those throb thud thumb thump thus tiara tidal
+tidy tiger tile tilt tint tiny trace track trade train trait trap trash tray treat tree
+trek trend trial tribe trick trio trout truce truck trump trunk try tug tulip tummy turf
+tusk tutor tutu tux tweak tweet twice twine twins twirl twist uncle uncut undo unify union
+unit untie upon upper urban used usher utter value vapor vegan venue verse vest veto vice
+video view viral virus visa visor vixen vocal voice void volt voter vowel wad wafer wager
+wages wagon wake walk wand wasp watch water wavy wheat whiff whole whoop wick widen widow
+width wife wifi wilt wimp wind wing wink wipe wired wiry wise wish wispy wok wolf
+womb wool woozy word work worry wound woven wrath wreck wrist xerox yahoo yam yard year
+yeast yelp yield yodel yoga yoyo yummy zebra zero zesty zippy zone zoom
+'@ -split '\s+' | Where-Object { $_ })
+}
+
+function Get-ScanRandomIndex {
+	param(
+		[Parameter(Mandatory)][ValidateRange(1, 65536)][int]$Count,
+		[Parameter(Mandatory)]$Generator
+	)
+	# Rejection sampling: discard values from the incomplete final block of
+	# the 32-bit range so every index is equally likely (no modulo bias).
+	$range = [uint64]4294967296
+	$limit = $range - ($range % [uint64]$Count)
+	$bytes = [byte[]]::new(4)
+	while ($true) {
+		$Generator.GetBytes($bytes)
+		$value = [uint64][BitConverter]::ToUInt32($bytes, 0)
+		if ($value -lt $limit) { return [int]($value % [uint64]$Count) }
+	}
+}
+
+function New-ScanPassphrase {
+	<#
+	.SYNOPSIS
+		Generates a passphrase such as "Brook-Ocean7-Gnat-Plaza-Rumor".
+	.DESCRIPTION
+		Picks capitalized words from the embedded EFF list with a CSPRNG, joins
+		them with hyphens, and appends one random digit to one random word.
+		Length provides the strength (5 words: 20-30 characters, ~57 bits),
+		while the mix of upper, lower, digit and symbol still satisfies the
+		Windows complexity policy. 30 characters stays within the 32-character
+		password field limit common on printers.
+	#>
+	param([ValidateRange(3, 10)][int]$WordCount = 5)
+	$words = Get-ScanPassphraseWordList
+	$generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+	try {
+		$parts = @(for ($i = 0; $i -lt $WordCount; $i++) {
+			$word = $words[(Get-ScanRandomIndex -Count $words.Count -Generator $generator)]
+			$word.Substring(0, 1).ToUpperInvariant() + $word.Substring(1)
+		})
+		$digitWord = Get-ScanRandomIndex -Count $WordCount -Generator $generator
+		$parts[$digitWord] += [string](Get-ScanRandomIndex -Count 10 -Generator $generator)
+		$bits = [Math]::Round($WordCount * [Math]::Log($words.Count, 2) + [Math]::Log(10 * $WordCount, 2), 1)
+		# Log strength only; never the passphrase itself.
+		Write-Verbose "Generated a $WordCount-word passphrase (~$bits bits of entropy)."
+		return $parts -join '-'
+	}
+	finally {
+		$generator.Dispose()
+	}
 }
 
 function Test-ScanUserAdministrator {
@@ -543,11 +672,14 @@ function Initialize-ScanUser {
 		}
 		else {
 			$safeDesc = $Description -replace '"', ''
+			# NET.EXE asks "Do you want to continue (Y/N)?" for passwords over 14
+			# characters (pre-Windows 2000 compatibility). Generated passphrases are
+			# longer, so answer on stdin rather than hanging on a hidden prompt.
 			if (-not $existingUser) {
-				$userOutput = net user $safeUser $safePass /add /fullname:"scans" /comment:"$safeDesc" /active:yes /expires:never /passwordchg:no 2>&1
+				$userOutput = 'Y' | net user $safeUser $safePass /add /fullname:"scans" /comment:"$safeDesc" /active:yes /expires:never /passwordchg:no 2>&1
 			}
 			else {
-				$userOutput = net user $safeUser $safePass /comment:"$safeDesc" 2>&1
+				$userOutput = 'Y' | net user $safeUser $safePass /comment:"$safeDesc" 2>&1
 			}
 			$userExitCode = $LASTEXITCODE
 			if ($userExitCode -ne 0) {
@@ -1506,7 +1638,7 @@ if ($script:settingsIconBitmap) {
 }
 
 $setupWindow.FindName('txtUsername').Text = $scanUser
-$setupWindow.FindName('txtPassword').Text = New-RandomPassword
+$setupWindow.FindName('txtPassword').Text = New-ScanPassphrase
 $setupWindow.FindName('txtFolderPath').Text = $folderPath
 $setupWindow.FindName('txtShareName').Text = $shareName
 
@@ -1669,7 +1801,7 @@ function Show-PasswordRetryDialog {
 	$passwordWindow.FindName('txtPassword').Text = $script:scanPass
 	$passwordWindow.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($script:scanPass)
 	$passwordWindow.FindName('btnGenerate').Add_Click({
-		$passwordWindow.FindName('txtPassword').Text = New-RandomPassword
+		$passwordWindow.FindName('txtPassword').Text = New-ScanPassphrase
 	})
 	if ($passwordWindow.ShowDialog() -eq $true) {
 		return $passwordWindow.FindName('txtPassword').Text

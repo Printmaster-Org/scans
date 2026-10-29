@@ -1247,15 +1247,55 @@ Describe 'Desktop shortcut setup' {
 	}
 }
 
-Describe 'Generated passwords' {
-	It 'returns the default length using only supported characters' {
-		$password = New-RandomPassword
-		$password.Length | Should Be 10
-		$password | Should Match '^[A-Za-z0-9!@#$%^&*+\-=?]+$'
+Describe 'Generated passphrases' {
+	It 'uses the curated EFF short word list' {
+		$words = Get-ScanPassphraseWordList
+		$words.Count | Should Be 1293
+		@($words | Sort-Object -Unique).Count | Should Be 1293
+		@($words | Where-Object { $_ -notmatch '^[a-z]{3,5}$' }).Count | Should Be 0
+		$words -contains 'scan' | Should Be $false
+		$words -contains 'user' | Should Be $false
 	}
 
-	It 'honors an explicitly requested password length' {
-		(New-RandomPassword -Length 24).Length | Should Be 24
+	It 'creates five capitalized hyphen-separated words with exactly one digit after a word' {
+		$words = Get-ScanPassphraseWordList
+		foreach ($attempt in 1..50) {
+			$passphrase = New-ScanPassphrase
+			$passphrase | Should Match '^([A-Z][a-z]{2,4}\d?-){4}[A-Z][a-z]{2,4}\d?$'
+			([regex]::Matches($passphrase, '\d')).Count | Should Be 1
+			($passphrase.Length -ge 20 -and $passphrase.Length -le 30) | Should Be $true
+			foreach ($part in $passphrase -split '-') {
+				$words -contains ($part -replace '\d', '').ToLowerInvariant() | Should Be $true
+			}
+			# Windows complexity: upper, lower, digit and symbol are all present.
+			$passphrase | Should MatchExactly '[A-Z]'
+			$passphrase | Should MatchExactly '[a-z]'
+		}
+	}
+
+	It 'honors an explicitly requested word count' {
+		@((New-ScanPassphrase -WordCount 7) -split '-').Count | Should Be 7
+	}
+
+	It 'varies the generated passphrase and digit position' {
+		$samples = @(1..40 | ForEach-Object { New-ScanPassphrase })
+		@($samples | Sort-Object -Unique).Count | Should Be 40
+		$positions = @($samples | ForEach-Object { @($_ -split '-').IndexOf((@($_ -split '-') | Where-Object { $_ -match '\d' })) } | Sort-Object -Unique)
+		($positions.Count -gt 1) | Should Be $true
+	}
+
+	It 'rejects random values from the biased tail instead of using modulo' {
+		$script:randomCalls = 0
+		$generator = [pscustomobject]@{}
+		$generator | Add-Member ScriptMethod GetBytes {
+			param([byte[]]$Buffer)
+			$script:randomCalls++
+			# First draw is 0xFFFFFFFF, inside the incomplete final block for 1293.
+			$fill = if ($script:randomCalls -eq 1) { 255 } else { 0 }
+			for ($i = 0; $i -lt $Buffer.Length; $i++) { $Buffer[$i] = $fill }
+		}
+		Get-ScanRandomIndex -Count 1293 -Generator $generator | Should Be 0
+		$script:randomCalls | Should Be 2
 	}
 }
 
@@ -1433,7 +1473,7 @@ Describe 'Password correction dialog' {
 		$script:progressWindow = $null
 		$script:scanPass = 'Rejected'
 		Initialize-TestTheme
-		Mock New-RandomPassword { 'GeneratedReplacement123!' }
+		Mock New-ScanPassphrase { 'Generated-Replacement7-Pass' }
 		Mock Set-WindowTheme {
 			$window | Add-Member ScriptMethod ShowDialog {
 				$this.FindName('txtError').Text | Should Be 'Password policy rejected'
@@ -1443,7 +1483,7 @@ Describe 'Password correction dialog' {
 				$this.FindName('txtPassword').Text = 'ManualReplacement!'
 				$this.FindName('btnAccept').IsEnabled | Should Be $true
 				$this.FindName('btnGenerate').RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
-				$this.FindName('txtPassword').Text | Should Be 'GeneratedReplacement123!'
+				$this.FindName('txtPassword').Text | Should Be 'Generated-Replacement7-Pass'
 				return $script:retryAccepted
 			} -Force
 		}
@@ -1451,8 +1491,8 @@ Describe 'Password correction dialog' {
 
 	It 'generates a replacement and returns only the accepted password without displaying a window' {
 		$script:retryAccepted = $true
-		Show-PasswordRetryDialog -ErrorText 'Password policy rejected' | Should Be 'GeneratedReplacement123!'
-		Assert-MockCalled New-RandomPassword -Times 1 -Exactly -Scope It
+		Show-PasswordRetryDialog -ErrorText 'Password policy rejected' | Should Be 'Generated-Replacement7-Pass'
+		Assert-MockCalled New-ScanPassphrase -Times 1 -Exactly -Scope It
 		$script:scanPass | Should Be 'Rejected'
 	}
 
