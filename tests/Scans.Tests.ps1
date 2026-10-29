@@ -95,7 +95,7 @@ function netsh {
 }
 
 function Initialize-TestTheme {
-	foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText')) {
+	foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText', 'thSuccess', 'thWarn', 'thDanger')) {
 		Set-Variable -Name $name -Value '#002b36' -Scope Script
 	}
 	$themeAssignment = $ast.Find({
@@ -119,7 +119,7 @@ Describe 'Scan account password errors' {
 
 	It 'catches a non-terminating New-LocalUser password rejection and stops hiding' {
 		Mock New-LocalUser { Write-Error 'Password rejected' -ErrorId InvalidPassword }
-		$result = @(Initialize-ScanUser -Username scans -Password weak -HideFromLogin $true)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'weak') -HideFromLogin $true)
 		$result.Count | Should Be 1
 		$result[0].Status | Should Be 'Failed'
 		$result[0].ErrorId | Should Match 'InvalidPassword'
@@ -130,24 +130,24 @@ Describe 'Scan account password errors' {
 	It 'catches a non-terminating Set-LocalUser password rejection' {
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
 		Mock Set-LocalUser { Write-Error 'Password rejected' -ErrorId InvalidPassword }
-		$result = @(Initialize-ScanUser -Username scans -Password weak)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'weak'))
 		$result[0].Status | Should Be 'Failed'
 		$result[0].ErrorId | Should Match 'InvalidPassword'
 	}
 
 	It 'preserves successful account creation and updates' {
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled New-LocalUser -Times 1 -Exactly -Scope It
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled Set-LocalUser -Times 1 -Exactly -Scope It
 	}
 
 	It 'requires confirmation before changing an existing account password' {
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled Confirm-ExistingScanAccountUpdate -Times 1 -Exactly -Scope It -ParameterFilter { $Username -eq 'scans' }
 		Assert-MockCalled Set-LocalUser -Times 1 -Exactly -Scope It
@@ -156,7 +156,7 @@ Describe 'Scan account password errors' {
 	It 'cancels before changing an existing account when confirmation is declined' {
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
 		Mock Confirm-ExistingScanAccountUpdate { $false }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!' -HideFromLogin $true)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!') -HideFromLogin $true)
 		$result[0].SetupCanceled | Should Be $true
 		$result[0].Message | Should Match 'no account changes were made'
 		Assert-MockCalled Set-LocalUser -Times 0 -Exactly -Scope It
@@ -166,7 +166,7 @@ Describe 'Scan account password errors' {
 	It 'refuses to change an existing local Administrators account' {
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
 		Mock Get-LocalGroupMember { @([pscustomobject]@{ Name = 'COMPUTER\scans' }) }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 		$result[0].Status | Should Be 'Failed'
 		$result[0].ErrorId | Should Match 'ProtectedAccount'
 		$result[0].Error | Should Match 'local Administrators group'
@@ -177,7 +177,7 @@ Describe 'Scan account password errors' {
 	It 'fails closed when administrator membership cannot be checked' {
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
 		Mock Get-LocalGroupMember { throw 'Membership lookup failed' }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 		$result[0].Status | Should Be 'Failed'
 		$result[0].Error | Should Match 'Membership lookup failed'
 		Assert-MockCalled Confirm-ExistingScanAccountUpdate -Times 0 -Exactly -Scope It
@@ -194,13 +194,13 @@ Describe 'Scan account password errors' {
 		$description | Should Not BeNullOrEmpty
 		($description.Length -le 48) | Should Be $true
 		$description | Should Be 'Scanning provided by PrintMaster'
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!' -Description $description)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!') -Description $description)
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled New-LocalUser -Times 1 -Exactly -Scope It -ParameterFilter {
 			$Description -eq 'Scanning provided by PrintMaster' -and $Description.Length -le 48
 		}
 		Mock Get-LocalUser { [pscustomobject]@{ Name = 'scans' } }
-		$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!' -Description $description)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!') -Description $description)
 		$result[0].Status | Should Be 'Success'
 		Assert-MockCalled Set-LocalUser -Times 1 -Exactly -Scope It -ParameterFilter {
 			$Description -eq 'Scanning provided by PrintMaster' -and $Description.Length -le 48
@@ -209,7 +209,7 @@ Describe 'Scan account password errors' {
 
 	It 'preserves non-password failures without classifying them as password errors' {
 		Mock New-LocalUser { Write-Error 'Access is denied' -ErrorId AccessDenied }
-		$result = @(Initialize-ScanUser -Username scans -Password example)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'example'))
 		$result[0].Status | Should Be 'Failed'
 		$result[0].ErrorId | Should Not Match 'InvalidPassword'
 		Get-ErrorRemediation $result[0].Error | Should Be $script:Remediation.AccessDenied
@@ -235,7 +235,7 @@ Describe 'Scan account password errors' {
 		Mock wmic { }
 		foreach ($lookupExitCode in @(2, 0)) {
 			$script:lookupExitCode = $lookupExitCode
-			$result = @(Initialize-ScanUser -Username scans -Password weak -HideFromLogin $true)
+			$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'weak') -HideFromLogin $true)
 			$result.Count | Should Be 1
 			$result[0].Status | Should Be 'Failed'
 			$result[0].ErrorId | Should Match 'InvalidPassword'
@@ -248,7 +248,7 @@ Describe 'Scan account password errors' {
 	It 'reports other legacy command failures rather than claiming success' {
 		$script:hasLocalAccounts = $false
 		Mock net { $global:LASTEXITCODE = 2; 'System error 5 has occurred. Access is denied.' }
-		$result = @(Initialize-ScanUser -Username scans -Password example)
+		$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'example'))
 		$result[0].Status | Should Be 'Failed'
 		$result[0].ErrorId | Should Not Match 'InvalidPassword'
 		$result[0].Error | Should Match 'Access is denied'
@@ -263,257 +263,488 @@ Describe 'Scan account password errors' {
 		Mock wmic { }
 		foreach ($lookupExitCode in @(2, 0)) {
 			$script:lookupExitCode = $lookupExitCode
-			$result = @(Initialize-ScanUser -Username scans -Password 'Valid-Example123!')
+			$result = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Valid-Example123!'))
 			$result[0].Status | Should Be 'Success'
 		}
 		Assert-MockCalled wmic -Times 1 -Exactly -Scope It
 	}
 }
 
-Describe 'Setup cancellation' {
-	It 'exits successfully without continuing setup when Cancel or window close dismisses the dialog' {
-		$decision = $ast.Find({
-			param($node)
-			$node -is [System.Management.Automation.Language.IfStatementAst] -and
-			$node.Clauses[0].Item1.Extent.Text -eq '$setupResult -eq $true'
-		}, $true)
-		$decision | Should Not BeNullOrEmpty
-		foreach ($result in @('$false', '$null')) {
-			$childScript = @(
-				'$ErrorActionPreference = "Stop"'
-				"`$setupResult = $result"
-				$decision.Extent.Text
-				'throw "Canceled setup must not continue."'
-			) -join "`n"
-			$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-			$executable = (Get-Process -Id $PID).Path
-			$output = & $executable -NoProfile -NonInteractive -STA -EncodedCommand $encoded 2>&1
-			$LASTEXITCODE | Should Be 0
-			($output | Out-String).Trim() | Should BeNullOrEmpty
-		}
+function New-TestSetupConfiguration {
+	param([hashtable]$Override = @{})
+	$configuration = [pscustomobject]@{
+		Username = 'scans'; FolderPath = 'C:\scans'; ShareName = 'scans'; Description = 'Scanning provided by PrintMaster'
+		CreateUser = $true; HideUser = $true; CreateFolder = $true; SetPermissions = $true; SetShare = $true
+		CreateShortcut = $true; CheckNetwork = $true; EnableDiscovery = $false
 	}
+	foreach ($key in $Override.Keys) { $configuration.$key = $Override[$key] }
+	return $configuration
 }
 
-Describe 'Account-dependent setup steps' {
+function Get-TestPlainText([securestring]$Secret) {
+	return Use-ScanPlainText -Secret $Secret -ScriptBlock { param($plain) $plain }
+}
+
+Describe 'Setup engine' {
+	$WarningPreference = 'SilentlyContinue'
 	BeforeEach {
-		$source = Get-Content $sourcePath -Raw
-		$start = $source.IndexOf('# Gather computer details')
-		$end = $source.IndexOf('[System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke', $start)
-		$script:runSteps = [scriptblock]::Create($source.Substring($start, $end - $start))
-		$script:createUser = $true
-		$script:hideUser = $true
-		$script:createFolder = $true
-		$script:setPermissions = $true
-		$script:setShare = $true
-		$script:createShortcut = $true
-		$script:checkNetworkSettings = $true
-		$script:enableNetworkDiscovery = $false
-		$script:hasCimInstance = $true
-		$script:hasErrors = $false
-		$script:progressMax = 10
-		$script:controls = @{}
-		foreach ($name in @('progressBar', 'txtStatus', 'btnDone', 'btnCopyPassword')) {
-			$script:controls[$name] = [pscustomobject]@{ Value = 0; Text = ''; IsEnabled = $false }
+		$script:iconPath = 'C:\ProgramData\scans.ico'
+		$script:testControls = @{
+			progressBar = [pscustomobject]@{ Value = 0; Maximum = 0 }
+			lstDetails  = [pscustomobject]@{ Items = New-Object System.Collections.ArrayList }
 		}
-		$script:progressWindow = New-Object PSObject -Property @{ Title = '' }
-		$script:progressWindow | Add-Member ScriptMethod FindName { param($name) $script:controls[$name] }
+		$script:progressWindow = New-Object PSObject
+		$script:progressWindow | Add-Member ScriptMethod FindName { param($name) $script:testControls[$name] }
+		$script:inputPassword = ConvertTo-ScanSecureString 'Original-Pass7-Phrase'
 		Mock Set-ProgressBar { }
-		Mock Show-StepResult { if ($result.Error) { $script:hasErrors = $true } }
-		Mock Get-CimInstance { [pscustomobject]@{ PartOfDomain = $false } }
+		Mock Get-ScanComputerIdentity { [pscustomobject]@{ ComputerName = 'PC1'; HostName = 'PC1'; Fqdn = $null; DomainJoined = $false } }
 		Mock Initialize-ScanUser { $script:testUserResults }
-		Mock Show-PasswordRetryDialog { throw 'Unexpected password retry dialog' }
-		Mock Initialize-ScanFolder { }
-		Mock Initialize-ScanShare { }
-		Mock Initialize-DesktopShortcut { }
-		Mock Set-NetworkConfiguration { }
+		Mock Request-ScanReplacementPassword { throw 'Unexpected password prompt' }
+		Mock Initialize-ScanFolder { @{ Status = 'Success'; Message = 'Folder ready'; Error = $null } }
+		Mock Initialize-ScanShare { @{ Status = 'Success'; Message = 'Share ready'; Error = $null } }
+		Mock Initialize-DesktopShortcut { @{ Status = 'Success'; Message = 'Shortcut ready'; Error = $null } }
+		Mock Set-NetworkConfiguration { @{ Status = 'Success'; Message = 'Network ready'; Error = $null } }
+		$script:testUserResults = @{ Status = 'Success'; Message = 'Account ready'; Error = $null }
 	}
 
 	It 'passes the Network Discovery opt-in to network setup' {
-		$script:testUserResults = @{ Status = 'Success'; Message = 'ok'; Error = $null }
-		. $script:runSteps
+		Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword | Out-Null
 		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It -ParameterFilter { -not $EnableDiscovery }
-		$script:enableNetworkDiscovery = $true
-		. $script:runSteps
+		Invoke-ScanSetup -Configuration (New-TestSetupConfiguration @{ EnableDiscovery = $true }) -Password $script:inputPassword | Out-Null
 		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It -ParameterFilter { $EnableDiscovery }
 	}
 
-	It 'skips permissions and shares and disables copying after account failure' {
-		$script:testUserResults = @{ Status = 'Failed'; Error = 'Rejected'; AccountSetupFailed = $true }
-		. $script:runSteps
+	It 'runs every selected step, records results, and returns the password it set' {
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
+		Assert-MockCalled Initialize-ScanUser -Times 1 -Exactly -Scope It -ParameterFilter { $HideFromLogin -and $Username -eq 'scans' -and $Password -eq $script:inputPassword }
+		Assert-MockCalled Initialize-ScanFolder -Times 1 -Exactly -Scope It -ParameterFilter { $SetPermissions }
+		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
+		Assert-MockCalled Initialize-DesktopShortcut -Times 1 -Exactly -Scope It -ParameterFilter { $IconPath -eq 'C:\ProgramData\scans.ico' }
+		$result.Canceled | Should Be $false
+		$result.AccountConfigured | Should Be $true
+		$result.ShareConfigured | Should Be $true
+		[object]::ReferenceEquals($result.Password, $script:inputPassword) | Should Be $true
+		@($result.Steps).Count | Should Be 5
+		@($result.Steps | Where-Object Status -ne 'Success').Count | Should Be 0
+		($result.Steps | ForEach-Object Category) -join ',' | Should Be 'Account,Folder,Share,Shortcut,Network'
+		$script:testControls.progressBar.Value | Should Be $script:progressMax
+		(Get-ScanSetupOutcome -Result $result).State | Should Be 'Ready'
+	}
+
+	It 'skips permissions and shares and reports not ready after account failure' {
+		$script:testUserResults = @{ Status = 'Failed'; Message = 'Account failed'; Error = 'Rejected'; AccountSetupFailed = $true }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanFolder -Times 1 -Exactly -Scope It -ParameterFilter { -not $SetPermissions }
 		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $false
-		$script:controls.btnDone.IsEnabled | Should Be $true
-		$script:progressWindow.Title | Should Match 'Completed with errors'
+		$result.AccountConfigured | Should Be $false
+		$result.Password | Should BeNullOrEmpty
+		$outcome = Get-ScanSetupOutcome -Result $result
+		$outcome.State | Should Be 'NotReady'
+		$outcome.FailedPrerequisites | Should Be @('scan account')
+		$outcome.Message | Should Not Match 'Ready for scanning'
 	}
 
 	It 'also gates dependent steps when the hide-user option triggers account setup' {
-		$script:createUser = $false
 		$script:testUserResults = @{ Status = 'Failed'; Error = 'Rejected'; AccountSetupFailed = $true }
-		. $script:runSteps
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration @{ CreateUser = $false }) -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanUser -Times 1 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $false
+		$result.AccountStepRan | Should Be $true
+		$result.Password | Should BeNullOrEmpty
 	}
 
-	It 'preserves dependent steps and password copying after successful account setup' {
-		$script:testUserResults = @{ Status = 'Success'; Error = $null }
-		. $script:runSteps
-		Assert-MockCalled Initialize-ScanFolder -Times 1 -Exactly -Scope It -ParameterFilter { $SetPermissions }
-		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $true
-	}
-
-	It 'retains a replacement share name and reports share failures without stopping independent steps' {
-		$script:testUserResults = @{ Status = 'Success'; Error = $null }
-		Mock Initialize-ScanShare { @{ Status = 'Success'; ShareName = 'printer-scans'; Error = $null } }
-		. $script:runSteps
-		$script:shareName | Should Be 'printer-scans'
-		Mock Initialize-ScanShare { @{ Status = 'Failed'; Error = 'Share review canceled' } }
-		. $script:runSteps
-		$script:shareName | Should Be 'printer-scans'
-		$script:progressWindow.Title | Should Match 'Completed with errors'
+	It 'retains a replacement share name and keeps running independent steps after a share failure' {
+		Mock Initialize-ScanShare { @{ Status = 'Success'; Message = 'Shared'; ShareName = 'printer-scans'; Error = $null } }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
+		$result.ShareName | Should Be 'printer-scans'
+		$result.ShareConfigured | Should Be $true
+		Mock Initialize-ScanShare { @{ Status = 'Failed'; Message = 'Share failed'; Error = 'Share review canceled' } }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
+		$result.ShareConfigured | Should Be $false
+		$result.ShareName | Should Be 'scans'
 		Assert-MockCalled Initialize-DesktopShortcut -Times 2 -Exactly -Scope It
+		(Get-ScanSetupOutcome -Result $result).FailedPrerequisites | Should Be @('SMB share')
 	}
 
 	It 'does not configure a share when folder permissions fail or their review is canceled' {
-		$script:testUserResults = @{ Status = 'Success'; Error = $null }
-		Mock Initialize-ScanFolder { @{ Status = 'Failed'; Error = 'Folder review canceled'; FolderSetupFailed = $true } }
-		. $script:runSteps
+		Mock Initialize-ScanFolder { @{ Status = 'Failed'; Message = 'Folder failed'; Error = 'Folder review canceled'; FolderSetupFailed = $true } }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It
-		$script:progressWindow.Title | Should Match 'Completed with errors'
-		$script:controls.btnDone.IsEnabled | Should Be $true
+		(Get-ScanSetupOutcome -Result $result).State | Should Be 'NotReady'
 	}
 
 	It 'pauses for replacement passwords until accepted, then resumes all selected steps' {
-		$script:scanPass = 'Rejected'
 		$script:attempts = 0
+		$script:seenPasswords = @()
 		Mock Initialize-ScanUser {
 			$script:attempts++
+			# Read now: superseded replacements are disposed once the next one arrives.
+			$script:seenPasswords += Get-TestPlainText $Password
 			if ($script:attempts -lt 3) {
 				@{ Status = 'Failed'; Error = 'Policy rejected'; ErrorId = 'InvalidPassword,NewLocalUserCommand'; AccountSetupFailed = $true }
 			}
 			else { @{ Status = 'Success'; Message = 'Account configured'; Error = $null } }
 		}
-		Mock Show-PasswordRetryDialog {
+		Mock Request-ScanReplacementPassword {
 			Assert-MockCalled Initialize-ScanFolder -Times 0 -Exactly -Scope It
-			Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
 			Assert-MockCalled Set-NetworkConfiguration -Times 0 -Exactly -Scope It
-			"Replacement$script:attempts!"
+			ConvertTo-ScanSecureString "Replacement$script:attempts!"
 		}
-		. $script:runSteps
-		Assert-MockCalled Initialize-ScanUser -Times 3 -Exactly -Scope It
-		Assert-MockCalled Initialize-ScanUser -Times 1 -Exactly -Scope It -ParameterFilter { $Password -eq 'Replacement2!' -and $HideFromLogin }
-		Assert-MockCalled Show-PasswordRetryDialog -Times 2 -Exactly -Scope It
-		Assert-MockCalled Initialize-ScanFolder -Times 1 -Exactly -Scope It -ParameterFilter { $SetPermissions }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
+		Assert-MockCalled Initialize-ScanUser -Times 3 -Exactly -Scope It -ParameterFilter { $HideFromLogin }
+		$script:seenPasswords -join ',' | Should Be 'Original-Pass7-Phrase,Replacement1!,Replacement2!'
+		Assert-MockCalled Request-ScanReplacementPassword -Times 2 -Exactly -Scope It -ParameterFilter { $ErrorText -eq 'Policy rejected' }
 		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
-		Assert-MockCalled Initialize-DesktopShortcut -Times 1 -Exactly -Scope It
-		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It
-		$script:scanPass | Should Be 'Replacement2!'
-		$script:hasErrors | Should Be $false
-		$script:progressWindow.Title | Should Be 'PrintMaster Scans Setup - Finished'
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $true
+		Get-TestPlainText $result.Password | Should Be 'Replacement2!'
+		(Get-TestPlainText $script:inputPassword) | Should Be 'Original-Pass7-Phrase'
+		@($result.Steps | Where-Object Status -eq 'Failed').Count | Should Be 0
 	}
 
-	It 'stops all remaining steps if password correction is canceled or closed' {
+	It 'stops all remaining steps if password correction is canceled' {
 		$script:testUserResults = @{ Status = 'Failed'; Error = '2245'; ErrorId = 'InvalidPassword'; AccountSetupFailed = $true }
-		Mock Show-PasswordRetryDialog { $null }
-		. $script:runSteps
+		Mock Request-ScanReplacementPassword { $null }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanUser -Times 1 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanFolder -Times 0 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
 		Assert-MockCalled Initialize-DesktopShortcut -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetworkConfiguration -Times 0 -Exactly -Scope It
-		Assert-MockCalled Show-StepResult -Times 0 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $false
-		$script:controls.btnDone.IsEnabled | Should Be $true
-		$script:progressWindow.Title | Should Be 'PrintMaster Scans Setup - Canceled'
+		$result.Canceled | Should Be $true
+		$result.Password | Should BeNullOrEmpty
+		@($result.Steps).Count | Should Be 1
+		$result.Steps[0].Status | Should Be 'Skipped'
+		$outcome = Get-ScanSetupOutcome -Result $result
+		$outcome.State | Should Be 'Canceled'
+		$outcome.Message | Should Match 'password correction was canceled'
+	}
+
+	It 'stops all remaining steps when the existing account change is declined' {
+		$script:testUserResults = @{ Status = 'Skipped'; Message = 'Canceled before changing existing account'; Error = $null; AccountSetupFailed = $true; SetupCanceled = $true }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
+		Assert-MockCalled Initialize-ScanFolder -Times 0 -Exactly -Scope It
+		$result.Canceled | Should Be $true
+		$result.Steps[0].Message | Should Match 'Canceled before changing'
 	}
 
 	It 'also offers correction for legacy error 2245 when only hiding is selected' {
-		$script:createUser = $false
 		Mock Initialize-ScanUser {
-			if ($Password -ne 'LegacyReplacement!') {
+			if ((Get-TestPlainText $Password) -ne 'LegacyReplacement!') {
 				@{ Status = 'Failed'; Error = 'System error 2245'; AccountSetupFailed = $true }
 			}
 			else { @{ Status = 'Success'; Error = $null } }
 		}
-		Mock Show-PasswordRetryDialog { 'LegacyReplacement!' }
-		. $script:runSteps
-		Assert-MockCalled Show-PasswordRetryDialog -Times 1 -Exactly -Scope It
+		Mock Request-ScanReplacementPassword { ConvertTo-ScanSecureString 'LegacyReplacement!' }
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration @{ CreateUser = $false }) -Password $script:inputPassword
+		Assert-MockCalled Request-ScanReplacementPassword -Times 1 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanUser -Times 2 -Exactly -Scope It -ParameterFilter { $HideFromLogin }
 		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $false
+		Get-TestPlainText $result.Password | Should Be 'LegacyReplacement!'
 	}
 
 	It 'does not block shares when only hiding the successfully configured account fails' {
-		$script:testUserResults = @(@{ Status = 'Success'; Error = $null }, @{ Status = 'Failed'; Error = 'Registry denied' })
-		. $script:runSteps
+		$script:testUserResults = @(@{ Status = 'Success'; Error = $null }, @{ Status = 'Failed'; Message = 'Hide failed'; Error = 'Registry denied' })
+		$result = Invoke-ScanSetup -Configuration (New-TestSetupConfiguration) -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $true
+		$result.Password | Should Not BeNullOrEmpty
 	}
 
-	It 'respects disabled setup steps and leaves password copying disabled' {
-		$script:createUser = $false
-		$script:hideUser = $false
-		$script:createFolder = $false
-		$script:setShare = $false
-		$script:createShortcut = $false
-		$script:checkNetworkSettings = $false
-		. $script:runSteps
+	It 'respects disabled steps and reports no password when the account step did not run' {
+		$configuration = New-TestSetupConfiguration @{ CreateUser = $false; HideUser = $false; CreateFolder = $false; SetShare = $false; CreateShortcut = $false; CheckNetwork = $false }
+		$result = Invoke-ScanSetup -Configuration $configuration -Password $script:inputPassword
 		Assert-MockCalled Initialize-ScanUser -Times 0 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanFolder -Times 0 -Exactly -Scope It
 		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
 		Assert-MockCalled Initialize-DesktopShortcut -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetworkConfiguration -Times 0 -Exactly -Scope It
-		$script:controls.btnCopyPassword.IsEnabled | Should Be $false
-		$script:progressWindow.Title | Should Be 'PrintMaster Scans Setup - Finished'
+		$result.AccountStepRan | Should Be $false
+		$result.Password | Should BeNullOrEmpty
+		(Get-ScanSetupOutcome -Result $result).State | Should Be 'Ready'
+	}
+
+	It 'counts progress the same way the steps run' {
+		Get-ScanProgressMaximum -Configuration (New-TestSetupConfiguration) | Should Be 12
+		Get-ScanProgressMaximum -Configuration (New-TestSetupConfiguration @{ CreateUser = $false; HideUser = $false; CheckNetwork = $false }) | Should Be 6
 	}
 }
 
-Describe 'Error popup routing' {
+Describe 'Setup step recording' {
+	$WarningPreference = 'SilentlyContinue'
 	BeforeEach {
 		$script:hasErrors = $false
-		$script:progressWindow = [pscustomobject]@{ Title = 'Test owner' }
+		$script:stepResults = $null
 		Mock Set-ProgressBar { }
-		Mock Show-ErrorPopup { }
+		Mock Show-ErrorPopup { throw 'Setup must not open error popups' }
 	}
 
-	It 'does not show a popup for successful or skipped steps' {
-		Show-StepResult @{ Message = 'Created folder'; Error = $null }
-		Show-StepResult @{ Message = 'Skipped share'; Error = $null }
-		Assert-MockCalled Show-ErrorPopup -Times 0 -Exactly -Scope It
+	It 'records successful and skipped steps without errors' {
+		Show-StepResult @{ Message = 'Created folder'; Error = $null } -Category 'Folder'
+		Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped share'; Error = $null } -Category 'Share'
 		$script:hasErrors | Should Be $false
+		($script:stepResults | ForEach-Object Status) -join ',' | Should Be 'Success,Skipped'
+		$script:stepResults[0].Category | Should Be 'Folder'
 	}
 
-	It 'shows password-specific remediation' {
-		Show-StepResult @{ Message = 'Account failed'; Error = 'Rejected'; ErrorId = 'InvalidPassword,NewLocalUserCommand' }
-		Assert-MockCalled Show-ErrorPopup -Times 1 -Exactly -Scope It -ParameterFilter {
-			$Title -eq 'Scan Account Password Rejected' -and
-			$Remediation -eq $script:Remediation.PasswordPolicy -and
-			$Message -match 'Windows rejected' -and $Owner -eq $script:progressWindow
-		}
+	It 'records password-specific remediation inline' {
+		Show-StepResult @{ Message = 'Account failed'; Error = 'Rejected'; ErrorId = 'InvalidPassword,NewLocalUserCommand' } -Category 'Account'
 		$script:hasErrors | Should Be $true
+		$script:stepResults[0].Status | Should Be 'Failed'
+		$script:stepResults[0].Tip | Should Be $script:Remediation.PasswordPolicy
+		Assert-MockCalled Set-ProgressBar -Times 1 -Exactly -Scope It -ParameterFilter { $text -match 'Tip: ' }
 	}
 
-	It 'shows matching remediation for each other known setup error' {
+	It 'records matching remediation for each other known setup error' {
 		foreach ($message in @('The trust relationship failed', 'Access is denied', 'UnauthorizedAccess', 'share is in use', 'File is being used')) {
 			Show-StepResult @{ Message = 'Step failed'; Error = $message }
 		}
-		Assert-MockCalled Show-ErrorPopup -Times 1 -Exactly -Scope It -ParameterFilter { $Remediation -eq $script:Remediation.TrustRelation }
-		Assert-MockCalled Show-ErrorPopup -Times 2 -Exactly -Scope It -ParameterFilter { $Remediation -eq $script:Remediation.AccessDenied }
-		Assert-MockCalled Show-ErrorPopup -Times 2 -Exactly -Scope It -ParameterFilter { $Remediation -eq $script:Remediation.ShareInUse }
+		$tips = @($script:stepResults | ForEach-Object Tip)
+		$tips[0] | Should Be $script:Remediation.TrustRelation
+		$tips[1] | Should Be $script:Remediation.AccessDenied
+		$tips[2] | Should Be $script:Remediation.AccessDenied
+		$tips[3] | Should Be $script:Remediation.ShareInUse
+		$tips[4] | Should Be $script:Remediation.ShareInUse
 	}
 
 	It 'preserves unexpected error details with generic actionable guidance' {
-		Show-StepResult @{ Message = 'Shortcut failed'; Error = 'COM error 123' }
-		Assert-MockCalled Show-ErrorPopup -Times 1 -Exactly -Scope It -ParameterFilter {
-			$Message -match 'Shortcut failed' -and $Message -match 'COM error 123' -and $Remediation -match 'administrator'
-		}
+		Show-StepResult @{ Message = 'Shortcut failed'; Error = 'COM error 123' } -Category 'Shortcut'
+		$script:stepResults[0].Error | Should Be 'COM error 123'
+		$script:stepResults[0].Tip | Should Match 'administrator'
 		Assert-MockCalled Set-ProgressBar -Times 1 -Exactly -Scope It -ParameterFilter { $text -match 'Error: COM error 123' }
-		$script:hasErrors | Should Be $true
+	}
+
+	It 'files optional results such as Network Discovery under Optional' {
+		Show-StepResult @{ Status = 'Failed'; Message = 'Discovery failed'; Error = 'Denied'; Optional = $true } -Category 'Network'
+		$script:stepResults[0].Category | Should Be 'Optional'
+	}
+}
+
+Describe 'Setup outcome and connection details' {
+	function New-TestStep([string]$Category, [string]$Status) {
+		[pscustomobject]@{ Category = $Category; Status = $Status; Message = "$Category $Status"; Error = $(if ($Status -eq 'Failed') { 'boom' }); Tip = $null }
+	}
+	$identity = [pscustomobject]@{ ComputerName = 'FRONTDESK'; HostName = 'FRONTDESK'; Fqdn = 'FRONTDESK.office.example'; DomainJoined = $false }
+
+	It 'reports optional-only failures as ready with a warning, never as not ready' {
+		$result = [pscustomobject]@{ Canceled = $false; Steps = @((New-TestStep Account Success), (New-TestStep Shortcut Failed), (New-TestStep Optional Failed)) }
+		$outcome = Get-ScanSetupOutcome -Result $result
+		$outcome.State | Should Be 'Warning'
+		$outcome.FailedPrerequisites.Count | Should Be 0
+	}
+
+	It 'lists every failed prerequisite once and never claims readiness on partial failure' {
+		$result = [pscustomobject]@{ Canceled = $false; Steps = @((New-TestStep Account Success), (New-TestStep Network Failed), (New-TestStep Network Failed), (New-TestStep Share Failed), (New-TestStep Shortcut Failed)) }
+		$outcome = Get-ScanSetupOutcome -Result $result
+		$outcome.State | Should Be 'NotReady'
+		$outcome.FailedPrerequisites | Should Be @('network and firewall settings', 'SMB share')
+		$outcome.Title | Should Be 'Not ready for scanning'
+	}
+
+	It 'lists usable IPv4 addresses per adapter and skips loopback, link-local, IPv6, and down adapters' {
+		function New-TestNic([string]$Name, [string]$Status, [string]$Type, [string[]]$Addresses) {
+			$nic = [pscustomobject]@{ Name = $Name; OperationalStatus = $Status; NetworkInterfaceType = $Type; Addresses = $Addresses }
+			$nic | Add-Member ScriptMethod GetIPProperties {
+				[pscustomobject]@{ UnicastAddresses = @($this.Addresses | ForEach-Object { [pscustomobject]@{ Address = [System.Net.IPAddress]::Parse($_) } }) }
+			}
+			return $nic
+		}
+		$nics = @(
+			(New-TestNic 'Ethernet' 'Up' 'Ethernet' @('192.168.1.20', 'fe80::1', '169.254.3.4')),
+			(New-TestNic 'Wi-Fi' 'Up' 'Wireless80211' @('10.0.0.7')),
+			(New-TestNic 'Loopback' 'Up' 'Loopback' @('127.0.0.1')),
+			(New-TestNic 'Old' 'Down' 'Ethernet' @('172.16.0.2'))
+		)
+		$addresses = @(Get-ScanNetworkAddresses -Interfaces $nics)
+		$addresses.Count | Should Be 2
+		($addresses | ForEach-Object { "$($_.Adapter)=$($_.Address)" }) -join ';' | Should Be 'Ethernet=192.168.1.20;Wi-Fi=10.0.0.7'
+		@(Get-ScanNetworkAddresses -Interfaces @()).Count | Should Be 0
+	}
+
+	It 'builds copyable connection details for every address without inventing values' {
+		$addresses = @([pscustomobject]@{ Adapter = 'Ethernet'; Address = '192.168.1.20' }, [pscustomobject]@{ Adapter = 'Wi-Fi'; Address = '10.0.0.7' })
+		$rows = @(Get-ScanConnectionDetails -Identity $identity -Username 'scans' -ShareName 'scans' -ShareConfigured $true -FolderPath 'C:\scans' -Addresses $addresses -PasswordAvailable $true)
+		$byKey = @{}; foreach ($row in $rows) { $byKey[$row.Key] = $row }
+		$byKey.username.Value | Should Be 'scans'
+		$byKey.qualifiedUsername.Value | Should Be 'FRONTDESK\scans'
+		$byKey.password.Sensitive | Should Be $true
+		$byKey.password.Value | Should BeNullOrEmpty
+		$byKey.password.CanCopy | Should Be $true
+		$byKey.domain.Value | Should Be 'FRONTDESK'
+		$byKey.hostName.Value | Should Be 'FRONTDESK'
+		$byKey.fqdn.Value | Should Be 'FRONTDESK.office.example'
+		$byKey.shareName.Value | Should Be 'scans'
+		$byKey.pathHost.Value | Should Be '\\FRONTDESK\scans'
+		$byKey.pathIp0.Value | Should Be '\\192.168.1.20\scans'
+		$byKey.pathIp1.Value | Should Be '\\10.0.0.7\scans'
+		$byKey.ip0.Value | Should Be '192.168.1.20'
+		$byKey.ip1.Hint | Should Match 'DHCP'
+		$byKey.port.Value | Should Be '445'
+		$byKey.localFolder.Value | Should Be 'C:\scans'
+		$byKey.localFolder.Value | Should Not Be $byKey.pathHost.Value
+		@($rows | Where-Object { $_.CanCopy -and -not $_.Sensitive -and [string]::IsNullOrEmpty($_.Value) }).Count | Should Be 0
+	}
+
+	It 'says when the password, FQDN, share, or addresses are unknown and disables their copy' {
+		$noSuffix = [pscustomobject]@{ ComputerName = 'PC2'; HostName = 'PC2'; Fqdn = $null; DomainJoined = $false }
+		$rows = @(Get-ScanConnectionDetails -Identity $noSuffix -Username 'scans' -ShareName 'scans' -ShareConfigured $false -FolderPath 'C:\scans' -Addresses @() -PasswordAvailable $false)
+		$byKey = @{}; foreach ($row in $rows) { $byKey[$row.Key] = $row }
+		$byKey.password.Value | Should Match 'Unknown'
+		$byKey.password.CanCopy | Should Be $false
+		$byKey.fqdn.CanCopy | Should Be $false
+		$byKey.shareName.Value | Should Match 'Not configured'
+		$byKey.shareName.CanCopy | Should Be $false
+		$byKey.ContainsKey('pathHost') | Should Be $false
+		$byKey.ip.Value | Should Match 'No usable IPv4'
+		$byKey.ip.CanCopy | Should Be $false
+	}
+
+	It 'builds a summary that never includes the password' {
+		$secretValue = 'Sentinel-Secret-4815'
+		$rows = @(Get-ScanConnectionDetails -Identity $identity -Username 'scans' -ShareName 'scans' -ShareConfigured $true -FolderPath 'C:\scans' -PasswordAvailable $true)
+		$outcome = [pscustomobject]@{ Title = 'Ready for scanning'; Message = 'All good' }
+		$summary = Get-ScanSetupSummaryText -Outcome $outcome -Details $rows -Steps @((New-TestStep Account Success), (New-TestStep Share Failed))
+		$summary | Should Match 'Password: \(not included\)'
+		$summary | Should Match '\[OK\] Account Success'
+		$summary | Should Match '\[FAILED\] Share Failed'
+		$summary | Should Not Match $secretValue
+	}
+}
+
+Describe 'Wizard configuration and review' {
+	It 'reports each invalid Configure input' {
+		$problems = @(Test-ScanWizardConfiguration -Configuration (New-TestSetupConfiguration @{ Username = ''; FolderPath = 'scans'; ShareName = '' }) -PasswordPresent $false)
+		$problems.Count | Should Be 4
+		$problems[0] | Should Match 'account name'
+		$problems[1] | Should Match 'password'
+		$problems[2] | Should Match 'local folder'
+		$problems[3] | Should Match 'share name'
+		@(Test-ScanWizardConfiguration -Configuration (New-TestSetupConfiguration @{ Username = 'a@b' }) -PasswordPresent $true)[0] | Should Match 'cannot contain'
+		@(Test-ScanWizardConfiguration -Configuration (New-TestSetupConfiguration @{ Username = 'x' * 21 }) -PasswordPresent $true)[0] | Should Match '20 characters'
+		@(Test-ScanWizardConfiguration -Configuration (New-TestSetupConfiguration @{ ShareName = 'bad/share' }) -PasswordPresent $true)[0] | Should Match 'Share names'
+	}
+
+	It 'accepts valid input and only requires what the selected steps use' {
+		@(Test-ScanWizardConfiguration -Configuration (New-TestSetupConfiguration) -PasswordPresent $true).Count | Should Be 0
+		$networkOnly = New-TestSetupConfiguration @{ CreateUser = $false; HideUser = $false; CreateFolder = $false; SetShare = $false; CreateShortcut = $false; FolderPath = ''; ShareName = '' }
+		@(Test-ScanWizardConfiguration -Configuration $networkOnly -PasswordPresent $false).Count | Should Be 0
+	}
+
+	It 'gates Apply on existing, administrator, and unverifiable accounts' {
+		$configuration = New-TestSetupConfiguration
+		$new = [pscustomobject]@{ Exists = $false; IsAdministrator = $false; CheckFailed = $false }
+		$existing = [pscustomobject]@{ Exists = $true; IsAdministrator = $false; CheckFailed = $false }
+		$admin = [pscustomobject]@{ Exists = $true; IsAdministrator = $true; CheckFailed = $false }
+		$failed = [pscustomobject]@{ Exists = $false; IsAdministrator = $false; CheckFailed = $true; Message = 'lookup failed' }
+		(Get-ScanReviewGate -Configuration $configuration -AccountState $new).CanApply | Should Be $true
+		$gate = Get-ScanReviewGate -Configuration $configuration -AccountState $existing -Confirmed $false
+		$gate.CanApply | Should Be $false
+		$gate.NeedsConfirmation | Should Be $true
+		$gate.Tone | Should Be 'Warn'
+		(Get-ScanReviewGate -Configuration $configuration -AccountState $existing -Confirmed $true).CanApply | Should Be $true
+		$gate = Get-ScanReviewGate -Configuration $configuration -AccountState $admin -Confirmed $true
+		$gate.CanApply | Should Be $false
+		$gate.Notice | Should Match 'Administrators'
+		$gate = Get-ScanReviewGate -Configuration $configuration -AccountState $failed
+		$gate.CanApply | Should Be $false
+		$gate.Notice | Should Match 'lookup failed'
+		(Get-ScanReviewGate -Configuration (New-TestSetupConfiguration @{ CreateUser = $false; HideUser = $false }) -AccountState $admin).CanApply | Should Be $true
+	}
+
+	It 'summarizes the planned changes without exposing the password' {
+		$rows = @(Get-ScanSetupReview -Configuration (New-TestSetupConfiguration) -AccountState ([pscustomobject]@{ Exists = $true }) -ComputerName 'PC1')
+		($rows | Where-Object Label -eq 'Scan account').Value | Should Match 'Update existing'
+		($rows | Where-Object Label -eq 'Scan account').Tone | Should Be 'Warn'
+		($rows | Where-Object Label -eq 'SMB share').Value | Should Be 'Share as \\PC1\scans'
+		($rows | Where-Object Label -eq 'Password').Value | Should Match 'hidden'
+		$rows = @(Get-ScanSetupReview -Configuration (New-TestSetupConfiguration @{ CheckNetwork = $false; CreateShortcut = $false }) -ComputerName 'PC1')
+		($rows | Where-Object Label -eq 'Network').Tone | Should Be 'Muted'
+		($rows | Where-Object Label -eq 'Desktop shortcut').Value | Should Be 'Not added'
+	}
+}
+
+Describe 'Secret handling' {
+	$WarningPreference = 'SilentlyContinue'
+	BeforeEach {
+		$script:hasLocalAccounts = $true
+		$script:sentinel = 'Sentinel-Secret-4815'
+		$script:sentinelSecret = ConvertTo-ScanSecureString $script:sentinel
+		Mock Get-LocalUser { $null }
+		Mock Get-LocalGroupMember { @() }
+		Mock Confirm-ExistingScanAccountUpdate { $true }
+	}
+
+	It 'round-trips plaintext only inside Use-ScanPlainText and makes secrets read-only' {
+		$script:sentinelSecret.IsReadOnly() | Should Be $true
+		Get-TestPlainText $script:sentinelSecret | Should Be $script:sentinel
+		Use-ScanPlainText -Secret $null -ScriptBlock { param($plain) "[$plain]" } | Should Be '[]'
+		Test-ScanSecretPresent -Secret $script:sentinelSecret | Should Be $true
+		Test-ScanSecretPresent -Secret (ConvertTo-ScanSecureString '') | Should Be $false
+		Test-ScanSecretPresent -Secret $null | Should Be $false
+	}
+
+	It 'redacts the password from text' {
+		Remove-ScanSecretText -Text "net user scans $($script:sentinel) failed" -Secret $script:sentinelSecret | Should Be 'net user scans [redacted] failed'
+		Remove-ScanSecretText -Text 'nothing here' -Secret $null | Should Be 'nothing here'
+	}
+
+	It 'passes a SecureString to the LocalAccounts cmdlets' {
+		Mock New-LocalUser { }
+		Initialize-ScanUser -Username scans -Password $script:sentinelSecret | Out-Null
+		Assert-MockCalled New-LocalUser -Times 1 -Exactly -Scope It -ParameterFilter { $Password -is [securestring] -and (Get-TestPlainText $Password) -eq $script:sentinel }
+	}
+
+	It 'keeps the password out of errors and verbose output when a cmdlet echoes it' {
+		Mock New-LocalUser { throw "Rejected password $($script:sentinel)" }
+		$VerbosePreference = 'Continue'
+		$output = Initialize-ScanUser -Username scans -Password $script:sentinelSecret 4>&1 3>&1
+		($output | Out-String) | Should Not Match $script:sentinel
+		$failure = @($output | Where-Object { $_ -is [hashtable] })[0]
+		$failure.Error | Should Match '\[redacted\]'
+	}
+
+	It 'keeps the password out of legacy NET.EXE failures while still using it' {
+		$script:hasLocalAccounts = $false
+		Mock net {
+			if (-not $Password) { $global:LASTEXITCODE = 2; return }
+			$script:netPassword = $Password
+			$global:LASTEXITCODE = 2
+			"The command failed for $Password"
+		}
+		$result = @(Initialize-ScanUser -Username scans -Password $script:sentinelSecret)
+		$script:netPassword | Should Be $script:sentinel
+		$result[0].Error | Should Not Match $script:sentinel
+		$result[0].Error | Should Match '\[redacted\]'
+	}
+
+	It 'marks sensitive clipboard data as excluded from history, cloud sync, and monitors' {
+		Add-Type -AssemblyName System.Windows.Forms
+		$data = New-ScanClipboardData -Text 'value' -Sensitive
+		$data.GetData([System.Windows.Forms.DataFormats]::UnicodeText) | Should Be 'value'
+		[BitConverter]::ToInt32($data.GetData('CanIncludeInClipboardHistory').ToArray(), 0) | Should Be 0
+		[BitConverter]::ToInt32($data.GetData('CanUploadToCloudClipboard').ToArray(), 0) | Should Be 0
+		$data.GetDataPresent('ExcludeClipboardContentFromMonitorProcessing') | Should Be $true
+		(New-ScanClipboardData -Text 'value').GetDataPresent('CanIncludeInClipboardHistory') | Should Be $false
+	}
+
+	It 'clears the copied password on close only if the clipboard still holds it' {
+		Mock Set-ScanClipboardText { }
+		Mock Clear-ScanClipboard { }
+		Copy-ScanSecret -Secret $script:sentinelSecret
+		Assert-MockCalled Set-ScanClipboardText -Times 1 -Exactly -Scope It -ParameterFilter { $Sensitive -and $Text -eq $script:sentinel }
+		Mock Get-ScanClipboardText { 'something the user copied later' }
+		Clear-ScanCopiedSecret
+		Assert-MockCalled Clear-ScanClipboard -Times 0 -Exactly -Scope It
+		$script:copiedSecret | Should BeNullOrEmpty
+
+		Copy-ScanSecret -Secret $script:sentinelSecret
+		Mock Get-ScanClipboardText { $script:sentinel }
+		Clear-ScanCopiedSecret
+		Assert-MockCalled Clear-ScanClipboard -Times 1 -Exactly -Scope It
+		Get-TestPlainText $script:sentinelSecret | Should Be $script:sentinel
+	}
+
+	It 'refuses to copy an empty password' {
+		{ Copy-ScanSecret -Secret $null } | Should Throw 'no password'
 	}
 }
 
@@ -531,28 +762,28 @@ Describe 'Account visibility' {
 	}
 
 	It 'creates the hiding key and value on non-domain computers' {
-		$results = @(Initialize-ScanUser -Username scans -Password 'Example123!' -HideFromLogin $true)
+		$results = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Example123!') -HideFromLogin $true)
 		$results.Count | Should Be 2
 		$results[1].Status | Should Be 'Success'
 		Assert-MockCalled New-ItemProperty -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'scans' -and $Value -eq 0 }
 	}
 
 	It 'does not modify visibility on a domain-joined computer' {
-		$results = @(Initialize-ScanUser -Username scans -Password 'Example123!' -HideFromLogin $true -DomainJoined $true)
+		$results = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Example123!') -HideFromLogin $true -DomainJoined $true)
 		$results[1].Status | Should Be 'Skipped'
 		Assert-MockCalled New-ItemProperty -Times 0 -Exactly -Scope It
 	}
 
 	It 'leaves an already hidden account unchanged' {
 		Mock Get-ItemProperty { [pscustomobject]@{ scans = 0 } }
-		$results = @(Initialize-ScanUser -Username scans -Password 'Example123!' -HideFromLogin $true)
+		$results = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Example123!') -HideFromLogin $true)
 		$results[1].Message | Should Match 'already hidden'
 		Assert-MockCalled New-ItemProperty -Times 0 -Exactly -Scope It
 	}
 
 	It 'reports non-terminating registry failures separately from account setup' {
 		Mock New-ItemProperty { Write-Error 'Access is denied' }
-		$results = @(Initialize-ScanUser -Username scans -Password 'Example123!' -HideFromLogin $true)
+		$results = @(Initialize-ScanUser -Username scans -Password (ConvertTo-ScanSecureString 'Example123!') -HideFromLogin $true)
 		$results[1].Status | Should Be 'Failed'
 		$results[1].AccountSetupFailed | Should BeNullOrEmpty
 	}
@@ -1467,54 +1698,254 @@ Describe 'Shared themed dialogs' {
 	}
 }
 
-Describe 'Password correction dialog' {
+Describe 'Setup wizard window' {
+	$WarningPreference = 'SilentlyContinue'
 	BeforeEach {
-		Add-Type -AssemblyName PresentationFramework
-		$script:progressWindow = $null
-		$script:scanPass = 'Rejected'
+		Add-Type -AssemblyName PresentationFramework, System.Windows.Forms
 		Initialize-TestTheme
-		Mock New-ScanPassphrase { 'Generated-Replacement7-Pass' }
-		Mock Set-WindowTheme {
-			$window | Add-Member ScriptMethod ShowDialog {
-				$this.FindName('txtError').Text | Should Be 'Password policy rejected'
-				$this.FindName('txtPassword').Text | Should Be 'Rejected'
-				$this.FindName('txtPassword').Text = ''
-				$this.FindName('btnAccept').IsEnabled | Should Be $false
-				$this.FindName('txtPassword').Text = 'ManualReplacement!'
-				$this.FindName('btnAccept').IsEnabled | Should Be $true
-				$this.FindName('btnGenerate').RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
-				$this.FindName('txtPassword').Text | Should Be 'Generated-Replacement7-Pass'
-				return $script:retryAccepted
-			} -Force
+		$script:hasDwmTheming = $false
+		$script:scanUser = 'scans'; $script:folderPath = 'C:\scans'; $script:shareName = 'scans'
+		$script:description = 'Scanning provided by PrintMaster'
+		foreach ($name in 'createUser', 'hideUser', 'createFolder', 'setPermissions', 'setShare', 'createShortcut', 'checkNetworkSettings') {
+			Set-Variable -Scope Script -Name $name -Value $true
 		}
+		$script:enableNetworkDiscovery = $false
+		$script:confirmedExistingAccount = $null
+		Mock New-ScanPassphrase { 'Alpha-Bravo7-Charlie-Delta' }
+		Mock Get-ScanAccountState { [pscustomobject]@{ Username = $Username; Exists = $false; IsAdministrator = $false; CheckFailed = $false; Message = $null } }
+		Mock Get-ScanNetworkAddresses { @([pscustomobject]@{ Adapter = 'Ethernet'; Address = '192.168.1.20' }) }
+		$script:wizard = New-ScanWizardWindow
+		$script:progressWindow = $script:wizard
+		Initialize-ScanWizard -Window $script:wizard -Configuration (New-ScanSetupConfiguration)
+	}
+	AfterEach {
+		$script:wizardBusy = $false
+		$script:wizard.Close()
 	}
 
-	It 'generates a replacement and returns only the accepted password without displaying a window' {
-		$script:retryAccepted = $true
-		Show-PasswordRetryDialog -ErrorText 'Password policy rejected' | Should Be 'Generated-Replacement7-Pass'
-		Assert-MockCalled New-ScanPassphrase -Times 1 -Exactly -Scope It
-		$script:scanPass | Should Be 'Rejected'
+	function Get-Control([string]$Name) { $script:wizard.FindName($Name) }
+	function Invoke-Click([string]$Name) {
+		(Get-Control $Name).RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
 	}
 
-	It 'returns no password when canceled or closed' {
-		foreach ($accepted in @($false, $null)) {
-			$script:retryAccepted = $accepted
-			$result = Show-PasswordRetryDialog -ErrorText 'Password policy rejected'
-			$result | Should BeNullOrEmpty
-		}
+	It 'starts on Configure with the settings inline, a masked generated passphrase, and no settings popup' {
+		$script:wizard.Tag | Should Be 'Configure'
+		$script:wizard.Title | Should Be 'PrintMaster Scans Setup'
+		(Get-Control 'pageConfigure').Visibility | Should Be 'Visible'
+		(Get-Control 'pageReview').Visibility | Should Be 'Collapsed'
+		(Get-Control 'btnBack').Visibility | Should Be 'Collapsed'
+		(Get-Control 'btnNext').Content | Should Be 'Next'
+		(Get-Control 'txtUsername').Text | Should Be 'scans'
+		(Get-Control 'expAdvanced').IsExpanded | Should Be $false
+		(Get-Control 'chkNetworkDiscovery').IsChecked | Should Be $false
+		(Get-Control 'configPasswordBox').Visibility | Should Be 'Visible'
+		(Get-Control 'configPasswordText').Visibility | Should Be 'Collapsed'
+		(Get-Control 'configPasswordBox').Password | Should Be 'Alpha-Bravo7-Charlie-Delta'
+		(Get-Control 'txtSharePreview').Text | Should Match '\\scans$'
+		Get-Control 'btnSettings' | Should BeNullOrEmpty
 	}
 
-	It 'starts with Retry disabled when the previous password is empty' {
-		$script:scanPass = ''
-		$script:retryAccepted = $false
-		Mock Set-WindowTheme {
-			$window | Add-Member ScriptMethod ShowDialog {
-				$this.FindName('txtPassword').Text | Should BeNullOrEmpty
-				$this.FindName('btnAccept').IsEnabled | Should Be $false
-				return $false
-			} -Force
+	It 'reveals, edits, generates, and re-masks through the shared password field' {
+		Invoke-Click 'configReveal'
+		(Get-Control 'configPasswordText').Visibility | Should Be 'Visible'
+		(Get-Control 'configPasswordText').Text | Should Be 'Alpha-Bravo7-Charlie-Delta'
+		(Get-Control 'configReveal').Content | Should Be 'Hide'
+		(Get-Control 'configPasswordText').Text = 'Typed-While-Shown'
+		(Get-Control 'configPasswordBox').Password | Should Be 'Typed-While-Shown'
+		Mock New-ScanPassphrase { 'Echo-Foxtrot3-Golf-Hotel' }
+		Invoke-Click 'configGenerate'
+		(Get-Control 'configPasswordText').Text | Should Be 'Echo-Foxtrot3-Golf-Hotel'
+		Invoke-Click 'configReveal'
+		(Get-Control 'configPasswordText').Visibility | Should Be 'Collapsed'
+		(Get-Control 'configPasswordText').Text | Should BeNullOrEmpty
+		Get-TestPlainText (Get-ScanPasswordFieldSecret -Window $script:wizard -Prefix 'config') | Should Be 'Echo-Foxtrot3-Golf-Hotel'
+	}
+
+	It 'keeps dependent options disabled until their parent step is selected' {
+		(Get-Control 'chkCreateFolder').IsChecked = $false
+		(Get-Control 'chkSetPermissions').IsEnabled | Should Be $false
+		(Get-Control 'chkNetworkSettings').IsChecked = $false
+		(Get-Control 'chkNetworkDiscovery').IsEnabled | Should Be $false
+		$configuration = Get-ScanWizardConfiguration -Window $script:wizard
+		$configuration.SetPermissions | Should Be $false
+		$configuration.EnableDiscovery | Should Be $false
+		(Get-Control 'chkNetworkSettings').IsChecked = $true
+		(Get-Control 'chkNetworkDiscovery').IsEnabled | Should Be $true
+	}
+
+	It 'stays on Configure and lists problems when input is invalid' {
+		(Get-Control 'txtUsername').Text = ''
+		Clear-ScanPasswordField -Window $script:wizard -Prefix 'config'
+		Invoke-Click 'btnNext'
+		$script:wizard.Tag | Should Be 'Configure'
+		(Get-Control 'pnlValidation').Visibility | Should Be 'Visible'
+		(Get-Control 'txtValidation').Text | Should Match 'account name'
+		(Get-Control 'txtValidation').Text | Should Match 'password'
+		Assert-MockCalled Get-ScanAccountState -Times 0 -Exactly -Scope It
+	}
+
+	It 'moves to Review and back without losing any choice' {
+		(Get-Control 'txtUsername').Text = 'printer'
+		(Get-Control 'txtShareName').Text = 'office-scans'
+		(Get-Control 'chkCreateShortcut').IsChecked = $false
+		(Get-Control 'chkNetworkDiscovery').IsChecked = $true
+		Invoke-Click 'btnNext'
+		$script:wizard.Tag | Should Be 'Review'
+		Assert-MockCalled Get-ScanAccountState -Times 1 -Exactly -Scope It -ParameterFilter { $Username -eq 'printer' }
+		(Get-Control 'btnNext').Content | Should Be 'Apply'
+		(Get-Control 'btnNext').IsEnabled | Should Be $true
+		(Get-Control 'btnBack').Visibility | Should Be 'Visible'
+		(Get-Control 'grdReview').Children.Count | Should BeGreaterThan 0
+		(Get-Control 'pnlAccountNotice').Visibility | Should Be 'Collapsed'
+		Invoke-Click 'btnBack'
+		$script:wizard.Tag | Should Be 'Configure'
+		(Get-Control 'txtUsername').Text | Should Be 'printer'
+		(Get-Control 'txtShareName').Text | Should Be 'office-scans'
+		(Get-Control 'chkCreateShortcut').IsChecked | Should Be $false
+		(Get-Control 'chkNetworkDiscovery').IsChecked | Should Be $true
+		(Get-Control 'configPasswordBox').Password | Should Be 'Alpha-Bravo7-Charlie-Delta'
+	}
+
+	It 'requires inline confirmation for an existing account and blocks administrators' {
+		Mock Get-ScanAccountState { [pscustomobject]@{ Username = $Username; Exists = $true; IsAdministrator = $false; CheckFailed = $false; Message = $null } }
+		Invoke-Click 'btnNext'
+		(Get-Control 'pnlAccountNotice').Visibility | Should Be 'Visible'
+		(Get-Control 'chkConfirmExisting').Visibility | Should Be 'Visible'
+		(Get-Control 'btnNext').IsEnabled | Should Be $false
+		(Get-Control 'chkConfirmExisting').IsChecked = $true
+		(Get-Control 'btnNext').IsEnabled | Should Be $true
+		Invoke-Click 'btnBack'
+		Mock Get-ScanAccountState { [pscustomobject]@{ Username = $Username; Exists = $true; IsAdministrator = $true; CheckFailed = $false; Message = $null } }
+		Invoke-Click 'btnNext'
+		(Get-Control 'chkConfirmExisting').IsChecked | Should Be $false
+		(Get-Control 'chkConfirmExisting').Visibility | Should Be 'Collapsed'
+		(Get-Control 'txtAccountNotice').Text | Should Match 'Administrators'
+		(Get-Control 'btnNext').IsEnabled | Should Be $false
+	}
+
+	It 'applies with the confirmed account and shows connection details on Done' {
+		Mock Get-ScanAccountState { [pscustomobject]@{ Username = $Username; Exists = $true; IsAdministrator = $false; CheckFailed = $false; Message = $null } }
+		Mock Invoke-ScanSetup {
+			$script:seenConfirmation = $script:confirmedExistingAccount
+			$script:seenPassword = Get-TestPlainText $Password
+			$script:seenBusy = $script:wizardBusy
+			$script:wizard.Tag | Should Be 'Apply'
+			(Get-Control 'btnCancel').IsEnabled | Should Be $false
+			$result = New-ScanSetupResult -Configuration $Configuration
+			$result.Identity = [pscustomobject]@{ ComputerName = 'FRONTDESK'; HostName = 'FRONTDESK'; Fqdn = $null; DomainJoined = $false }
+			$result.AccountStepRan = $true; $result.AccountConfigured = $true; $result.ShareConfigured = $true
+			$result.Password = $Password
+			$result.Steps = @([pscustomobject]@{ Category = 'Account'; Status = 'Success'; Message = 'Account ready'; Error = $null; Tip = $null })
+			$result
 		}
-		Show-PasswordRetryDialog -ErrorText 'Password required' | Should BeNullOrEmpty
+		Invoke-Click 'btnNext'
+		(Get-Control 'chkConfirmExisting').IsChecked = $true
+		Invoke-Click 'btnNext'
+		$script:seenConfirmation | Should Be 'scans'
+		$script:seenPassword | Should Be 'Alpha-Bravo7-Charlie-Delta'
+		$script:seenBusy | Should Be $true
+		$script:wizardBusy | Should Be $false
+		$script:confirmedExistingAccount | Should BeNullOrEmpty
+		$script:wizard.Tag | Should Be 'Done'
+		$script:wizard.Title | Should Match 'Ready for scanning'
+		(Get-Control 'txtOutcomeTitle').Text | Should Be 'Ready for scanning'
+		(Get-Control 'btnNext').Content | Should Be 'Close'
+		(Get-Control 'btnBack').Content | Should Be 'Back to setup'
+		(Get-Control 'btnCancel').Visibility | Should Be 'Collapsed'
+		(Get-Control 'pnlConnection').Visibility | Should Be 'Visible'
+		@($script:connectionDetails | Where-Object Key -eq 'password')[0].CanCopy | Should Be $true
+		(Get-Control 'pnlResults').Children.Count | Should Be 1
+		Invoke-Click 'btnBack'
+		$script:wizard.Tag | Should Be 'Configure'
+		$script:wizardResult | Should BeNullOrEmpty
+		(Get-Control 'txtUsername').Text | Should Be 'scans'
+	}
+
+	It 'records unexpected setup errors on the Done page instead of crashing' {
+		Mock Get-ScanComputerIdentity { [pscustomobject]@{ ComputerName = 'PC1'; HostName = 'PC1'; Fqdn = $null; DomainJoined = $false } }
+		Mock Set-ProgressBar { }
+		Mock Invoke-ScanSetup { $script:stepResults = New-Object System.Collections.ArrayList; throw 'Kaboom' }
+		Invoke-Click 'btnNext'
+		Invoke-Click 'btnNext'
+		$script:wizard.Tag | Should Be 'Done'
+		(Get-Control 'txtOutcomeTitle').Text | Should Be 'Not ready for scanning'
+		@($script:wizardResult.Steps)[0].Error | Should Be 'Kaboom'
+		@($script:connectionDetails | Where-Object Key -eq 'password')[0].Value | Should Match 'Unknown'
+	}
+
+	It 'hides connection details and leads with results when setup is canceled' {
+		Mock Invoke-ScanSetup {
+			$result = New-ScanSetupResult -Configuration $Configuration
+			$result.Canceled = $true; $result.CancelReason = 'password correction was canceled'
+			$result.Steps = @([pscustomobject]@{ Category = 'Account'; Status = 'Skipped'; Message = 'Canceled'; Error = $null; Tip = $null })
+			$result
+		}
+		Invoke-Click 'btnNext'
+		Invoke-Click 'btnNext'
+		(Get-Control 'txtOutcomeTitle').Text | Should Be 'Setup canceled'
+		(Get-Control 'pnlConnection').Visibility | Should Be 'Collapsed'
+		[array]::IndexOf(@((Get-Control 'pageDone').Children), (Get-Control 'pnlResultsSection')) | Should Be 1
+	}
+
+	It 'returns a replacement password from the inline retry panel and cleans up' {
+		Mock Wait-ScanWizardPrompt {
+			(Get-Control 'pnlPasswordRetry').Visibility | Should Be 'Visible'
+			(Get-Control 'txtRetryError').Text | Should Be 'Policy rejected'
+			(Get-Control 'btnRetryPassword').IsEnabled | Should Be $false
+			(Get-Control 'retryPasswordBox').Password = 'Manual-Replacement9'
+			(Get-Control 'btnRetryPassword').IsEnabled | Should Be $true
+			$true
+		}
+		$replacement = Request-ScanReplacementPassword -ErrorText 'Policy rejected' -Window $script:wizard
+		Get-TestPlainText $replacement | Should Be 'Manual-Replacement9'
+		(Get-Control 'pnlPasswordRetry').Visibility | Should Be 'Collapsed'
+		(Get-Control 'retryPasswordBox').Password | Should BeNullOrEmpty
+		Mock Wait-ScanWizardPrompt { $false }
+		Request-ScanReplacementPassword -ErrorText 'Policy rejected' -Window $script:wizard | Should BeNullOrEmpty
+	}
+
+	It 'resolves the inline prompt from the Retry and Cancel setup buttons' {
+		$script:wizardPromptFrame = [System.Windows.Threading.DispatcherFrame]::new()
+		Invoke-Click 'btnRetryPassword'
+		$script:wizardPromptResult | Should Be $true
+		$script:wizardPromptFrame.Continue | Should Be $false
+		Invoke-Click 'btnRetryCancel'
+		$script:wizardPromptResult | Should Be $false
+		$script:wizardPromptFrame = $null
+	}
+
+	It 'copies each connection detail through the right clipboard path' {
+		Mock Set-ScanClipboardText { }
+		Mock Copy-ScanSecret { }
+		$script:wizardResult = [pscustomobject]@{ Password = ConvertTo-ScanSecureString 'Copied-Secret1'; Steps = @() }
+		$identity = [pscustomobject]@{ ComputerName = 'FRONTDESK'; HostName = 'FRONTDESK'; Fqdn = 'FRONTDESK.lan'; DomainJoined = $false }
+		$script:connectionDetails = @(Get-ScanConnectionDetails -Identity $identity -Username 'scans' -ShareName 'scans' -ShareConfigured $true -FolderPath 'C:\scans' -Addresses @(Get-ScanNetworkAddresses) -PasswordAvailable $true)
+		foreach ($row in $script:connectionDetails | Where-Object { $_.CanCopy -and -not $_.Sensitive }) {
+			Copy-ScanConnectionDetail -Window $script:wizard -Key $row.Key
+			$expected = $row.Value
+			Assert-MockCalled Set-ScanClipboardText -Times 1 -Scope It -ParameterFilter { $Text -eq $expected -and -not $Sensitive }
+		}
+		Copy-ScanConnectionDetail -Window $script:wizard -Key 'password'
+		Assert-MockCalled Copy-ScanSecret -Times 1 -Exactly -Scope It -ParameterFilter { [object]::ReferenceEquals($Secret, $script:wizardResult.Password) }
+		(Get-Control 'txtCopyStatus').Text | Should Match 'Copied the password'
+		$script:connectionDetails = @(Get-ScanConnectionDetails -Identity $identity -Username 'scans' -ShareName 'scans' -ShareConfigured $true -FolderPath 'C:\scans' -PasswordAvailable $false)
+		Copy-ScanConnectionDetail -Window $script:wizard -Key 'password'
+		Assert-MockCalled Copy-ScanSecret -Times 1 -Exactly -Scope It
+	}
+
+	It 'masks the Done page password until Show is pressed' {
+		$script:wizardResult = [pscustomobject]@{ Password = ConvertTo-ScanSecureString 'Shown-Secret2'; Steps = @() }
+		$value = [System.Windows.Controls.TextBlock]::new()
+		$value.Text = [string]::new([char]0x25CF, 12)
+		$button = [System.Windows.Controls.Button]::new()
+		$button.Content = 'Show'
+		$button.Tag = $value
+		Switch-ScanDonePasswordReveal -Button $button
+		$value.Text | Should Be 'Shown-Secret2'
+		$button.Content | Should Be 'Hide'
+		Switch-ScanDonePasswordReveal -Button $button
+		$value.Text | Should Be ([string]::new([char]0x25CF, 12))
+		$button.Content | Should Be 'Show'
 	}
 }
 
@@ -1628,11 +2059,18 @@ Describe 'Folder access review dialog' {
 			$ratio = ([Math]::Max($luminance[0], $luminance[1]) + 0.05) / ([Math]::Min($luminance[0], $luminance[1]) + 0.05)
 			($ratio -ge 4.5) | Should Be $true
 		}
+		$palette = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.IfStatementAst] -and
+			$node.Clauses[0].Item1.Extent.Text -eq '$script:useDarkTheme'
+		}, $true)
 		foreach ($dark in @($true, $false)) {
 			$script:useDarkTheme = $dark
-			$script:thBgAlt = if ($dark) { '#073642' } else { '#eee8d5' }
+			# Check the shipped palette, not test placeholders.
+			. ([scriptblock]::Create($palette.Extent.Text))
 			Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' | Out-Null
 		}
+		Initialize-TestTheme
 	}
 
 	It 'does not return an ineligible row even if its model is marked for removal' {
@@ -1879,77 +2317,59 @@ Describe 'WPF window markup' {
 		$offset = (32 * 64 + 46) * 4
 		($pixels[$offset..($offset + 3)] -join ',') | Should Be '120,187,72,255'
 		$source = Get-Content $sourcePath -Raw
-		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 4
+		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 2
 		$source | Should Not Match '\[System\.Windows\.MessageBox\]::Show'
-		$source | Should Match "Initialize-DesktopShortcut -FolderPath .folderPath -IconPath .iconPath"
+		$source | Should Match 'Initialize-DesktopShortcut -FolderPath .c\.FolderPath -IconPath .script:iconPath'
 		$source | Should Match '\[IO.File\]::WriteAllBytes\(\$iconPath, \[Convert\]::FromBase64String\(\$script:appIconBase64\)\)'
 	}
 
-	It 'decodes the settings image in a fresh PowerShell process before loading any windows' {
-		$assemblyLoads = $ast.FindAll({
+	It 'keeps status text colors readable on both backgrounds in both themes' {
+		$palette = $ast.Find({
 			param($node)
-			$node -is [System.Management.Automation.Language.CommandAst] -and
-			$node.GetCommandName() -eq 'Add-Type' -and $node.Extent.StartLineNumber -lt 20
+			$node -is [System.Management.Automation.Language.IfStatementAst] -and
+			$node.Clauses[0].Item1.Extent.Text -eq '$script:useDarkTheme'
 		}, $true)
-		$iconAssignment = $ast.Find({
-			param($node)
-			$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-			$node.Left.Extent.Text -eq '$script:settingsIconBase64'
-		}, $true)
-		$iconLoad = $ast.Find({
-			param($node)
-			$node -is [System.Management.Automation.Language.TryStatementAst] -and
-			$node.Body.Extent.Text -match '\$script:settingsIconBase64'
-		}, $true)
-		$childScript = @(
-			'$ErrorActionPreference = "Stop"; $WarningPreference = "Stop"'
-			$assemblyLoads | ForEach-Object { $_.Extent.Text }
-			$iconAssignment.Extent.Text
-			$iconLoad.Extent.Text
-			'if ($script:settingsIconBitmap.PixelWidth -le 0) { throw "Settings image was not decoded." }'
-			'$script:settingsIconBitmap.GetType().FullName'
-		) -join "`n"
-		$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-		$executable = (Get-Process -Id $PID).Path
-		$output = & $executable -NoProfile -NonInteractive -STA -EncodedCommand $encoded 2>&1
-		$LASTEXITCODE | Should Be 0
-		($output | Out-String).Trim() | Should Be 'System.Windows.Media.Imaging.BitmapImage'
+		function Get-TestLuminance([string]$Hex) {
+			$color = [System.Windows.Media.ColorConverter]::ConvertFromString($Hex)
+			$channels = foreach ($channel in @($color.R, $color.G, $color.B)) {
+				$value = $channel / 255.0
+				if ($value -le 0.04045) { $value / 12.92 } else { [Math]::Pow(($value + 0.055) / 1.055, 2.4) }
+			}
+			return 0.2126 * $channels[0] + 0.7152 * $channels[1] + 0.0722 * $channels[2]
+		}
+		foreach ($dark in @($true, $false)) {
+			$script:useDarkTheme = $dark
+			. ([scriptblock]::Create($palette.Extent.Text))
+			foreach ($foreground in @($script:thSuccess, $script:thWarn, $script:thDanger, $script:thFgStrong)) {
+				foreach ($background in @($script:thBg, $script:thBgAlt)) {
+					$a = Get-TestLuminance $foreground
+					$b = Get-TestLuminance $background
+					$ratio = ([Math]::Max($a, $b) + 0.05) / ([Math]::Min($a, $b) + 0.05)
+					"$foreground on $background = $([Math]::Round($ratio, 2))" | Should Not Match ' = ([0-3]\.|4\.[0-4])'
+				}
+			}
+		}
+		Initialize-TestTheme
 	}
 
-	It 'loads setup and progress windows without displaying them or running setup' {
+	It 'loads the setup wizard without displaying it or running setup' {
 		Add-Type -AssemblyName PresentationFramework
 		Initialize-TestTheme
-		foreach ($name in @('$script:themeResources', '$setupXaml', '$progressXaml', '$passwordRetryContent')) {
-			$assignment = $ast.Find({
-				param($node)
-				$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-				($node.Left.Extent.Text -replace '^\[xml\]', '') -eq $name
-			}, $true)
-			. ([scriptblock]::Create($assignment.Extent.Text))
+		$wizard = New-ScanWizardWindow
+		try {
+			$wizard.Title | Should Be 'PrintMaster Scans Setup'
+			$wizard.Icon | Should Not BeNullOrEmpty
+			$wizard.FindName('imgLogo').Source | Should Be $wizard.Icon
+			$wizard.FindName('txtProvider').Text | Should Be 'Provided by PrintMaster'
+			foreach ($name in @('pageConfigure', 'pageReview', 'pageApply', 'pageDone', 'txtUsername', 'configPasswordBox', 'configReveal', 'configGenerate',
+					'txtFolderPath', 'btnBrowse', 'txtShareName', 'expAdvanced', 'grdReview', 'chkConfirmExisting', 'progressBar', 'lstDetails',
+					'pnlPasswordRetry', 'retryPasswordBox', 'btnRetryPassword', 'grdConnection', 'pnlResults', 'btnCopySummary', 'btnBack', 'btnNext')) {
+				$wizard.FindName($name) | Should Not BeNullOrEmpty
+			}
+			$wizard.FindName('btnCancel').IsCancel | Should Be $true
+			$wizard.FindName('btnNext').IsDefault | Should Be $true
+			$wizard.FindName('pnlPasswordRetry').Visibility | Should Be 'Collapsed'
 		}
-		$setup = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($setupXaml))
-		$progress = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($progressXaml))
-		$passwordRetry = New-ScanDialog -Title 'Password Rejected' -ContentXaml $passwordRetryContent -AcceptText 'Retry' -CancelText 'Cancel setup'
-		foreach ($name in @('txtError', 'txtRemediation', 'txtPassword', 'btnGenerate', 'btnAccept', 'btnCancel')) {
-			$passwordRetry.FindName($name) | Should Not BeNullOrEmpty
-		}
-		$passwordRetry.FindName('btnCancel').IsCancel | Should Be $true
-		$passwordRetry.FindName('btnAccept').IsDefault | Should Be $true
-		foreach ($window in @($setup, $progress)) {
-			$window.Icon = New-PrintMasterIcon
-			$window.Icon | Should Not BeNullOrEmpty
-			$window.Title | Should Match '^PrintMaster Scans'
-			$window.FindName('txtProvider').Text | Should Be 'Provided by PrintMaster'
-		}
-		foreach ($name in @('txtUsername', 'txtPassword', 'txtFolderPath', 'txtShareName', 'btnOK', 'btnCancel', 'btnSettings')) {
-			$setup.FindName($name) | Should Not BeNullOrEmpty
-		}
-		$setup.FindName('txtSettingsIconFallback') | Should Not BeNullOrEmpty
-		$setup.FindName('rectSettingsIcon').Visibility | Should Be ([System.Windows.Visibility]::Collapsed)
-		$progress.FindName('btnDone').IsEnabled | Should Be $false
-		$progress.FindName('btnCopyPassword').IsEnabled | Should Be $false
-		$setup.Close()
-		$progress.Close()
-		$passwordRetry.Close()
+		finally { $wizard.Close() }
 	}
 }

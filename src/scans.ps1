@@ -2,7 +2,6 @@ param([switch]$Elevated)
 
 # Setup variables and defaults
 [string]$scanUser = 'scans'
-[string]$scanPass = 'scans'
 [string]$folderPath = 'C:\scans'
 [string]$shareName = 'scans'
 [string]$description = 'Scanning provided by PrintMaster'
@@ -139,7 +138,6 @@ $script:hasSmbShareCmdlets = [bool](Get-Command -Name 'Get-SmbShare' -ErrorActio
 $script:hasNetSecurity = [bool](Get-Command -Name 'Get-NetFirewallRule' -ErrorAction SilentlyContinue)
 $script:hasNetConnection = [bool](Get-Command -Name 'Get-NetConnectionProfile' -ErrorAction SilentlyContinue)
 $script:hasCimInstance = [bool](Get-Command -Name 'Get-CimInstance' -ErrorAction SilentlyContinue)
-$script:hasSetClipboard = [bool](Get-Command -Name 'Set-Clipboard' -ErrorAction SilentlyContinue)
 
 # --- Theme detection (Solarized Light/Dark, defaults to Dark) ---
 $script:useDarkTheme = $true
@@ -153,11 +151,14 @@ if ($script:useDarkTheme) {
 	$script:thFg = '#839496'; $script:thFgEm = '#93a1a1'; $script:thFgStrong = '#eee8d5'
 	$script:thAccent = '#268bd2'; $script:thAccentHi = '#2aa198'
 	$script:thBorder = '#586e75'; $script:thBtnText = '#fdf6e3'
+	# Status colors are tuned per theme for readable contrast on thBg/thBgAlt.
+	$script:thSuccess = '#93a83a'; $script:thWarn = '#d7af35'; $script:thDanger = '#ef9865'
 } else {
 	$script:thBg = '#fdf6e3'; $script:thBgAlt = '#eee8d5'
 	$script:thFg = '#657b83'; $script:thFgEm = '#586e75'; $script:thFgStrong = '#073642'
 	$script:thAccent = '#268bd2'; $script:thAccentHi = '#2aa198'
 	$script:thBorder = '#93a1a1'; $script:thBtnText = '#fdf6e3'
+	$script:thSuccess = '#4f6b00'; $script:thWarn = '#875f00'; $script:thDanger = '#a52a00'
 }
 
 $script:themeResources = @"
@@ -212,6 +213,16 @@ $script:themeResources = @"
             <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
             <Setter Property="BorderBrush" Value="$($script:thBorder)"/>
             <Setter Property="Padding" Value="4,3"/>
+        </Style>
+        <Style TargetType="PasswordBox">
+            <Setter Property="Background" Value="$($script:thBgAlt)"/>
+            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            <Setter Property="BorderBrush" Value="$($script:thBorder)"/>
+            <Setter Property="Padding" Value="4,3"/>
+            <Setter Property="PasswordChar" Value="&#x25CF;"/>
+        </Style>
+        <Style TargetType="Expander">
+            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
         </Style>
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="$($script:thFg)"/>
@@ -570,6 +581,275 @@ function New-ScanPassphrase {
 	}
 }
 
+# --- Secret handling ---
+# Passwords travel through setup as read-only SecureString instances. Plaintext is
+# only materialized inside Use-ScanPlainText, for the few APIs that require it
+# (legacy NET.EXE, clipboard, PasswordBox assignment, explicit reveal). Note the
+# limits: SecureString is not encryption at rest, and .NET strings created from it
+# cannot be zeroed, so this narrows exposure rather than eliminating it.
+
+function ConvertTo-ScanSecureString {
+	param([string]$PlainText)
+	$secure = [System.Security.SecureString]::new()
+	foreach ($character in ([string]$PlainText).ToCharArray()) { $secure.AppendChar($character) }
+	$secure.MakeReadOnly()
+	return $secure
+}
+
+function Use-ScanPlainText {
+	<#
+	.SYNOPSIS
+		Runs ScriptBlock with the secret's plaintext as its first argument.
+	.DESCRIPTION
+		The unmanaged BSTR copy is zeroed and freed in finally, even when the
+		script block throws. Callers must not log or store the argument.
+	#>
+	param(
+		[System.Security.SecureString]$Secret,
+		[scriptblock]$ScriptBlock
+	)
+	if ($null -eq $Secret) { return & $ScriptBlock '' }
+	$secretPointer = [IntPtr]::Zero
+	try {
+		$secretPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+		return & $ScriptBlock ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($secretPointer))
+	}
+	finally {
+		if ($secretPointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secretPointer) }
+	}
+}
+
+function Test-ScanSecretPresent {
+	# Checks length without converting the secret to plaintext.
+	param([System.Security.SecureString]$Secret)
+	return ($null -ne $Secret -and $Secret.Length -gt 0)
+}
+
+function Remove-ScanSecretText {
+	<#
+	.SYNOPSIS
+		Replaces any occurrence of the secret in Text with [redacted].
+	.DESCRIPTION
+		Used on command output and exception messages before they reach logs,
+		step results, or the screen. Tools such as NET.EXE can echo arguments.
+	#>
+	param(
+		[string]$Text,
+		[System.Security.SecureString]$Secret
+	)
+	if ([string]::IsNullOrEmpty($Text) -or -not (Test-ScanSecretPresent -Secret $Secret)) { return $Text }
+	return Use-ScanPlainText -Secret $Secret -ScriptBlock {
+		param($plainSecret)
+		$Text.Replace($plainSecret, '[redacted]')
+	}
+}
+
+function New-ScanClipboardData {
+	<#
+	.SYNOPSIS
+		Builds a clipboard payload. Sensitive payloads opt out of monitoring,
+		Windows clipboard history, and cloud clipboard sync.
+	.LINK
+		https://learn.microsoft.com/windows/win32/dataxchg/clipboard-formats#cloud-clipboard-and-clipboard-history-formats
+	#>
+	param(
+		[string]$Text,
+		[switch]$Sensitive
+	)
+	$data = New-Object System.Windows.Forms.DataObject
+	$data.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $Text)
+	if ($Sensitive) {
+		$data.SetData('ExcludeClipboardContentFromMonitorProcessing', [IO.MemoryStream]::new([byte[]]@(0)))
+		$data.SetData('CanIncludeInClipboardHistory', [IO.MemoryStream]::new([BitConverter]::GetBytes([int]0)))
+		$data.SetData('CanUploadToCloudClipboard', [IO.MemoryStream]::new([BitConverter]::GetBytes([int]0)))
+	}
+	return $data
+}
+
+function Set-ScanClipboardText {
+	param(
+		[string]$Text,
+		[switch]$Sensitive
+	)
+	# copy=$true keeps the data available after Scans exits; retry briefly if
+	# another process holds the clipboard open.
+	[System.Windows.Forms.Clipboard]::SetDataObject((New-ScanClipboardData -Text $Text -Sensitive:$Sensitive), $true, 5, 100)
+}
+
+function Get-ScanClipboardText {
+	if ([System.Windows.Forms.Clipboard]::ContainsText()) { return [System.Windows.Forms.Clipboard]::GetText() }
+	return $null
+}
+
+function Clear-ScanClipboard {
+	[System.Windows.Forms.Clipboard]::Clear()
+}
+
+function Copy-ScanSecret {
+	<#
+	.SYNOPSIS
+		Copies a secret after a deliberate user action and remembers it so
+		Clear-ScanCopiedSecret can remove it when Scans closes.
+	#>
+	param([System.Security.SecureString]$Secret)
+	if (-not (Test-ScanSecretPresent -Secret $Secret)) { throw 'There is no password to copy.' }
+	Use-ScanPlainText -Secret $Secret -ScriptBlock {
+		param($plainSecret)
+		Set-ScanClipboardText -Text $plainSecret -Sensitive
+	}
+	if ($script:copiedSecret) { $script:copiedSecret.Dispose() }
+	$script:copiedSecret = $Secret.Copy()
+	$script:copiedSecret.MakeReadOnly()
+	Write-Verbose 'Copied the scan password to the clipboard, excluded from clipboard history and cloud sync where Windows supports it.'
+}
+
+function Clear-ScanCopiedSecret {
+	<#
+	.SYNOPSIS
+		On close, clears the clipboard only if it still holds the copied secret,
+		so anything the user copied afterwards is left untouched.
+	#>
+	if (-not $script:copiedSecret) { return }
+	try {
+		$clipboardText = Get-ScanClipboardText
+		$stillCopied = Use-ScanPlainText -Secret $script:copiedSecret -ScriptBlock {
+			param($plainSecret)
+			[string]::Equals($clipboardText, $plainSecret, [StringComparison]::Ordinal)
+		}
+		if ($stillCopied) {
+			Clear-ScanClipboard
+			Write-Verbose 'Cleared the copied scan password from the clipboard.'
+		}
+		else {
+			Write-Verbose 'Clipboard changed after the scan password was copied; leaving it untouched.'
+		}
+	}
+	catch {
+		Write-Warning "Could not check the clipboard for the copied password: $($_.Exception.Message)"
+	}
+	finally {
+		$script:copiedSecret.Dispose()
+		$script:copiedSecret = $null
+	}
+}
+
+# --- Shared password field ---
+# One masked input used by the wizard's Configure page and the inline retry
+# prompt: PasswordBox by default, Show swaps in a TextBox, Generate creates a
+# passphrase. Controls are named <Prefix>PasswordBox/PasswordText/Reveal/Generate
+# and carry the prefix in Tag so handlers need no closures.
+
+function Get-ScanPasswordFieldXaml {
+	param(
+		[ValidatePattern('^[a-z]+$')][string]$Prefix,
+		[ValidatePattern('^[A-Za-z ]+$')][string]$Label = 'Password'
+	)
+	return @"
+<DockPanel>
+    <Button DockPanel.Dock="Right" Name="${Prefix}Generate" Tag="$Prefix" Content="Generate" MinWidth="86" Margin="6,0,0,0"
+            ToolTip="Replace with a new random passphrase" AutomationProperties.Name="Generate $Label"/>
+    <Button DockPanel.Dock="Right" Name="${Prefix}Reveal" Tag="$Prefix" Content="Show" MinWidth="62" Margin="6,0,0,0"
+            Style="{StaticResource SecondaryButton}" ToolTip="Show or hide the password" AutomationProperties.Name="Show $Label"/>
+    <Grid>
+        <PasswordBox Name="${Prefix}PasswordBox" Tag="$Prefix" AutomationProperties.Name="$Label"/>
+        <TextBox Name="${Prefix}PasswordText" Tag="$Prefix" Visibility="Collapsed" FontFamily="Consolas" AutomationProperties.Name="$Label (shown)"/>
+    </Grid>
+</DockPanel>
+"@
+}
+
+function Get-ScanPasswordFieldParts {
+	param($Window, [string]$Prefix)
+	return [pscustomobject]@{
+		Box      = $Window.FindName("${Prefix}PasswordBox")
+		Text     = $Window.FindName("${Prefix}PasswordText")
+		Reveal   = $Window.FindName("${Prefix}Reveal")
+		Generate = $Window.FindName("${Prefix}Generate")
+	}
+}
+
+function Test-ScanPasswordFieldRevealed {
+	param($Window, [string]$Prefix)
+	return (Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix).Text.Visibility -eq 'Visible'
+}
+
+function Set-ScanPasswordFieldRevealed {
+	param($Window, [string]$Prefix, [bool]$Revealed)
+	$field = Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix
+	if ($Revealed) {
+		# Showing is an explicit user request, so plaintext in the TextBox is expected.
+		$field.Text.Text = $field.Box.Password
+		$field.Box.Visibility = 'Collapsed'
+		$field.Text.Visibility = 'Visible'
+		$field.Reveal.Content = 'Hide'
+	}
+	else {
+		# Collapse first so the TextChanged sync handler ignores the Clear().
+		$field.Text.Visibility = 'Collapsed'
+		$field.Text.Clear()
+		$field.Box.Visibility = 'Visible'
+		$field.Reveal.Content = 'Show'
+	}
+	Write-Verbose "Password field '$Prefix' is now $(if ($Revealed) { 'shown' } else { 'masked' })."
+}
+
+function Set-ScanPasswordFieldText {
+	param($Window, [string]$Prefix, [string]$Text)
+	$field = Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix
+	$field.Box.Password = $Text
+	if ($field.Text.Visibility -eq 'Visible') { $field.Text.Text = $Text }
+}
+
+function Set-ScanPasswordFieldSecret {
+	param($Window, [string]$Prefix, [System.Security.SecureString]$Secret)
+	# PasswordBox only accepts plaintext assignment; keep it inside the helper scope.
+	Use-ScanPlainText -Secret $Secret -ScriptBlock {
+		param($plainSecret)
+		Set-ScanPasswordFieldText -Window $Window -Prefix $Prefix -Text $plainSecret
+	}
+}
+
+function Get-ScanPasswordFieldSecret {
+	param($Window, [string]$Prefix)
+	# SecurePassword returns a fresh copy owned by the caller.
+	$secret = (Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix).Box.SecurePassword
+	$secret.MakeReadOnly()
+	return $secret
+}
+
+function Test-ScanPasswordFieldHasValue {
+	param($Window, [string]$Prefix)
+	$secret = Get-ScanPasswordFieldSecret -Window $Window -Prefix $Prefix
+	try { return (Test-ScanSecretPresent -Secret $secret) }
+	finally { $secret.Dispose() }
+}
+
+function Clear-ScanPasswordField {
+	param($Window, [string]$Prefix)
+	Set-ScanPasswordFieldRevealed -Window $Window -Prefix $Prefix -Revealed $false
+	(Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix).Box.Clear()
+}
+
+function Register-ScanPasswordField {
+	param($Window, [string]$Prefix)
+	$field = Get-ScanPasswordFieldParts -Window $Window -Prefix $Prefix
+	$field.Reveal.Add_Click({
+		$owner = [System.Windows.Window]::GetWindow($this)
+		Set-ScanPasswordFieldRevealed -Window $owner -Prefix $this.Tag -Revealed (-not (Test-ScanPasswordFieldRevealed -Window $owner -Prefix $this.Tag))
+	})
+	$field.Generate.Add_Click({
+		Set-ScanPasswordFieldText -Window ([System.Windows.Window]::GetWindow($this)) -Prefix $this.Tag -Text (New-ScanPassphrase)
+		Write-Verbose "Generated a replacement passphrase for password field '$($this.Tag)'."
+	})
+	# While shown, the TextBox is the editor; mirror edits into the PasswordBox so
+	# it stays the single source read by Get-ScanPasswordFieldSecret.
+	$field.Text.Add_TextChanged({
+		if ($this.Visibility -ne 'Visible') { return }
+		$box = [System.Windows.Window]::GetWindow($this).FindName("$($this.Tag)PasswordBox")
+		if ($box.Password -ne $this.Text) { $box.Password = $this.Text }
+	})
+}
+
 function Test-ScanUserAdministrator {
 	param(
 		[string]$Username,
@@ -600,6 +880,12 @@ function Test-ScanUserAdministrator {
 function Confirm-ExistingScanAccountUpdate {
 	param([string]$Username)
 
+	# The wizard Review page collects this consent inline; the modal remains the
+	# fallback when the account appears between Review and Apply.
+	if ($script:confirmedExistingAccount -and $script:confirmedExistingAccount -ieq $Username) {
+		Write-Verbose "Using the Review page confirmation to change existing account '$Username'."
+		return $true
+	}
 	$message = "A local account named '$Username' already exists. Continuing will change its password and may affect anything that uses it. Continue only if this is the account you intend to use for scanning."
 	Write-Verbose "Requesting confirmation before changing the password for existing account '$Username'."
 	return Show-ScanMessage -Title 'Existing Account Password Change' -Message $message `
@@ -607,37 +893,71 @@ function Confirm-ExistingScanAccountUpdate {
 		-AcceptText 'Change password' -CancelText 'Cancel setup' -Confirm -Owner $script:progressWindow
 }
 
+function ConvertTo-ScanSafeAccountName {
+	# Legacy NET.EXE receives arguments on a command line; keep names to a safe set.
+	param([string]$Username)
+	return $Username -replace '[^a-zA-Z0-9_\-]', ''
+}
+
+function Get-ScanExistingAccount {
+	<#
+	.SYNOPSIS
+		Returns the existing local account (LocalUser object, or $true on legacy
+		systems), or $null when the account does not exist. Other lookup errors throw.
+	#>
+	param([string]$Username)
+	if ($script:hasLocalAccounts) {
+		try {
+			return Get-LocalUser -Name $Username -ErrorAction Stop
+		}
+		catch {
+			if ($_.FullyQualifiedErrorId -match 'UserNotFound') { return $null }
+			throw
+		}
+	}
+	net user (ConvertTo-ScanSafeAccountName -Username $Username) 2>&1 | Out-Null
+	if ($LASTEXITCODE -eq 0) { return $true }
+	return $null
+}
+
+function Get-ScanAccountState {
+	<#
+	.SYNOPSIS
+		Read-only pre-check for the Review page: does the account exist, and is
+		it protected (an administrator, or membership could not be verified)?
+	#>
+	param([string]$Username)
+	$state = [pscustomobject]@{ Username = $Username; Exists = $false; IsAdministrator = $false; CheckFailed = $false; Message = $null }
+	try {
+		$account = Get-ScanExistingAccount -Username $Username
+		if (-not $account) {
+			Write-Verbose "Account pre-check: '$Username' does not exist and will be created."
+			return $state
+		}
+		$state.Exists = $true
+		$state.IsAdministrator = [bool](Test-ScanUserAdministrator -Username $Username -User $account)
+		Write-Verbose "Account pre-check: '$Username' exists (administrator: $($state.IsAdministrator))."
+	}
+	catch {
+		$state.CheckFailed = $true
+		$state.Message = $_.Exception.Message
+		Write-Warning "Account pre-check for '$Username' failed: $($state.Message)"
+	}
+	return $state
+}
+
 function Initialize-ScanUser {
 	param(
 		[string]$Username,
-		[string]$Password,
+		[System.Security.SecureString]$Password,
 		[string]$Description,
 		[bool]$HideFromLogin,
 		[bool]$DomainJoined
 	)
 	$results = @()
 	try {
-		$existingUser = $null
-		if ($script:hasLocalAccounts) {
-			try {
-				$existingUser = Get-LocalUser -Name $Username -ErrorAction Stop
-			}
-			catch {
-				if ($_.FullyQualifiedErrorId -match 'UserNotFound') {
-					$existingUser = $null
-				}
-				else {
-					throw
-				}
-			}
-		}
-		else {
-			# Sanitize inputs for external commands to prevent injection.
-			$safeUser = $Username -replace '[^a-zA-Z0-9_\-]', ''
-			$safePass = $Password -replace '"', ''
-			net user $safeUser 2>&1 | Out-Null
-			$existingUser = $LASTEXITCODE -eq 0
-		}
+		$existingUser = Get-ScanExistingAccount -Username $Username
+		$safeUser = ConvertTo-ScanSafeAccountName -Username $Username
 
 		if ($existingUser) {
 			if (Test-ScanUserAdministrator -Username $Username -User $existingUser) {
@@ -660,30 +980,37 @@ function Initialize-ScanUser {
 		}
 
 		if ($script:hasLocalAccounts) {
-			$securePass = $Password | ConvertTo-SecureString -AsPlainText -Force
+			# The LocalAccounts cmdlets take the SecureString directly; no plaintext copy.
 			if (-not $existingUser) {
-				New-LocalUser -Name $Username -Password $securePass -Description $Description -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -FullName "scans" -ErrorAction Stop | Out-Null
+				New-LocalUser -Name $Username -Password $Password -Description $Description -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -FullName "scans" -ErrorAction Stop | Out-Null
 				$results += @{ Status = 'Success'; Message = "Created new user '$Username'"; Error = $null }
 			}
 			else {
-				Set-LocalUser -Name $Username -Password $securePass -Description $Description -ErrorAction Stop | Out-Null
+				Set-LocalUser -Name $Username -Password $Password -Description $Description -ErrorAction Stop | Out-Null
 				$results += @{ Status = 'Success'; Message = "Updated existing user '$Username'"; Error = $null }
 			}
 		}
 		else {
 			$safeDesc = $Description -replace '"', ''
+			# Legacy fallback: NET.EXE only accepts the password as a command-line
+			# argument, so plaintext is unavoidable here. It exists only inside
+			# Use-ScanPlainText, and the output is redacted before it is reported.
 			# NET.EXE asks "Do you want to continue (Y/N)?" for passwords over 14
 			# characters (pre-Windows 2000 compatibility). Generated passphrases are
 			# longer, so answer on stdin rather than hanging on a hidden prompt.
-			if (-not $existingUser) {
-				$userOutput = 'Y' | net user $safeUser $safePass /add /fullname:"scans" /comment:"$safeDesc" /active:yes /expires:never /passwordchg:no 2>&1
-			}
-			else {
-				$userOutput = 'Y' | net user $safeUser $safePass /comment:"$safeDesc" 2>&1
+			$userOutput = Use-ScanPlainText -Secret $Password -ScriptBlock {
+				param($plainSecret)
+				$safePass = $plainSecret -replace '"', ''
+				if (-not $existingUser) {
+					'Y' | net user $safeUser $safePass /add /fullname:"scans" /comment:"$safeDesc" /active:yes /expires:never /passwordchg:no 2>&1
+				}
+				else {
+					'Y' | net user $safeUser $safePass /comment:"$safeDesc" 2>&1
+				}
 			}
 			$userExitCode = $LASTEXITCODE
 			if ($userExitCode -ne 0) {
-				$errorText = ($userOutput | Out-String).Trim()
+				$errorText = Remove-ScanSecretText -Text ($userOutput | Out-String).Trim() -Secret $Password
 				$errorId = 'LocalUserCommandFailed'
 				# NET.EXE can return exit code 2 while reporting system error 2245 in its output.
 				if ($userExitCode -eq 2245 -or $errorText -match '\b2245\b') {
@@ -704,7 +1031,11 @@ function Initialize-ScanUser {
 		}
 	}
 	catch {
-		$results += @{ Status = 'Failed'; Message = "Failed to configure user '$Username'"; Error = $_.Exception.Message; ErrorId = $_.FullyQualifiedErrorId; AccountSetupFailed = $true }
+		# Defense in depth: no error path may carry the password to the UI or logs.
+		$errorMessage = Remove-ScanSecretText -Text $_.Exception.Message -Secret $Password
+		# A thrown string becomes the FullyQualifiedErrorId too, so redact it as well.
+		$errorId = Remove-ScanSecretText -Text $_.FullyQualifiedErrorId -Secret $Password
+		$results += @{ Status = 'Failed'; Message = "Failed to configure user '$Username'"; Error = $errorMessage; ErrorId = $errorId; AccountSetupFailed = $true }
 		return $results
 	}
 
@@ -881,8 +1212,8 @@ function Show-ScanFolderAccessDialog {
 		[array]$CleanupRules
 	)
 
-	$warningColor = if ($script:useDarkTheme) { '#d7af35' } else { '#875f00' }
-	$dangerColor = if ($script:useDarkTheme) { '#ef9865' } else { '#a52a00' }
+	$warningColor = $script:thWarn
+	$dangerColor = $script:thDanger
 	$folderAccessContent = @"
         <StackPanel>
             <StackPanel.Resources>
@@ -1201,7 +1532,7 @@ function Get-ScanShareAccessRows {
 function Show-ScanShareAccessDialog {
 	param([string]$ShareName, [string]$FolderPath, [string]$ScanAccount, [array]$Rows)
 
-	$warningColor = if ($script:useDarkTheme) { '#d7af35' } else { '#875f00' }
+	$warningColor = $script:thWarn
 	$content = @"
 <StackPanel>
     <Border Background="$($script:thBgAlt)" CornerRadius="5" Padding="12" Margin="0,0,0,10">
@@ -1493,7 +1824,10 @@ function Set-NetworkConfiguration {
 	# helps printers that browse for the PC instead of using a typed path.
 	$results += Enable-ScanFirewallGroup -Group 'File and Printer Sharing' -Label 'File and Printer Sharing' -FirewallProfile $firewallProfile
 	if ($EnableDiscovery) {
-		$results += Enable-ScanFirewallGroup -Group 'Network Discovery' -Label 'Network Discovery' -FirewallProfile $firewallProfile
+		# Discovery is opt-in, so its failure does not make the PC unready for typed paths.
+		$discoveryResult = Enable-ScanFirewallGroup -Group 'Network Discovery' -Label 'Network Discovery' -FirewallProfile $firewallProfile
+		$discoveryResult.Optional = $true
+		$results += $discoveryResult
 	}
 	else {
 		# Never disable an existing rule: earlier versions or administrators may rely on it.
@@ -1509,229 +1843,11 @@ $iconPath = 'C:\ProgramData\scans.ico'
 if (!(Test-Path $iconPath)) {
 	[IO.File]::WriteAllBytes($iconPath, [Convert]::FromBase64String($script:appIconBase64))
 }
-# --- Embedded settings gear icon (base64 PNG, theme-aware via OpacityMask) ---
-$script:settingsIconBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAGAAAABkCAQAAADTAP2lAAAAxHpUWHRSYXcgcHJvZmlsZSB0eXBlIGV4aWYAAHjabVDbEcMgDPtnio4AlkPscUiT3nWDjl+DnV5oqzvkhxJhnI7X85FuHVQ48bJK1VqzgZWVmiWSHW1wyTx4oIZk9dRPlUMga8EivJT4o5z98jHw0CxbLkZyD2GbBY0LSL6MyAP6RD3fw0jDCORCCYPW4ikq6/UJ25FniJ/UiWUe+6debXv7YveA6EBBNgaqD4B+OKFZAmOC2ocZOjpszDjNbCH/9nQivQHrcFkdUfZFZgAAASNpQ0NQSUNDIHByb2ZpbGUAAHicnZC/SsNQFMZ/aUVF7KQ4iEIG1y6CmRz8h8GhUNMIRqc0abGYxJCkFN/AN9GH6SAIPoOzgrPfjQ4OZvHCyffjcM733Rto2UmUlgsHkGZV4XqHwWVwZS+90Wabjr67YVTmvcGpT+P5fMUy+tI1Xs1zf57FeFRG0rkqi/KiAmtf7Myq3LCK9VvfOxY/iO04zWLxk3gnTmPDZtdLk2n042luszrKLgamr9rC5YwefWyGTJmQUNGVZuqc4LAndSkIuackkiaM1JtppuJGVMrJ5Ujki3SbhrzNOq+vlKE8JvIyCXek8jR5mP/7vfZxXm9aG/M8LMK61Va1xmN4f4ROAGvPsHLdkLX8+20NM0498883fgEty1CH2lf0fwAADXZpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+Cjx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IlhNUCBDb3JlIDQuNC4wLUV4aXYyIj4KIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIKICAgIHhtbG5zOnhtcE1NPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvbW0vIgogICAgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyIKICAgIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIKICAgIHhtbG5zOkdJTVA9Imh0dHA6Ly93d3cuZ2ltcC5vcmcveG1wLyIKICAgIHhtbG5zOnRpZmY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vdGlmZi8xLjAvIgogICAgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIgogICB4bXBNTTpEb2N1bWVudElEPSJnaW1wOmRvY2lkOmdpbXA6NmZhZmE1Y2EtN2VhNy00YTA1LTgzODAtZTM4M2UyMTZhOGZjIgogICB4bXBNTTpJbnN0YW5jZUlEPSJ4bXAuaWlkOmU0NDU3ODRmLTkyNTktNDc3Ny05YWI5LTg3OWU2ZWNjMGMzOSIKICAgeG1wTU06T3JpZ2luYWxEb2N1bWVudElEPSJ4bXAuZGlkOmFiYjc3ZGRiLTYyYmQtNGQ5Yi1iYzViLTk4YTBmM2VlZWY5NCIKICAgZGM6Rm9ybWF0PSJpbWFnZS9wbmciCiAgIEdJTVA6QVBJPSIyLjAiCiAgIEdJTVA6UGxhdGZvcm09IldpbmRvd3MiCiAgIEdJTVA6VGltZVN0YW1wPSIxNzExNzE3NDgwNTk0NDgyIgogICBHSU1QOlZlcnNpb249IjIuMTAuMzYiCiAgIHRpZmY6T3JpZW50YXRpb249IjEiCiAgIHhtcDpDcmVhdG9yVG9vbD0iR0lNUCAyLjEwIgogICB4bXA6TWV0YWRhdGFEYXRlPSIyMDI0OjAzOjI5VDA5OjA0OjQwLTA0OjAwIgogICB4bXA6TW9kaWZ5RGF0ZT0iMjAyNDowMzoyOVQwOTowNDo0MC0wNDowMCI+CiAgIDx4bXBNTTpIaXN0b3J5PgogICAgPHJkZjpTZXE+CiAgICAgPHJkZjpsaQogICAgICBzdEV2dDphY3Rpb249InNhdmVkIgogICAgICBzdEV2dDpjaGFuZ2VkPSIvIgogICAgICBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjc5NjdmN2QxLTUyMTgtNDM5Ni05NTUwLTVkN2M1YzJmMmExNiIKICAgICAgc3RFdnQ6c29mdHdhcmVBZ2VudD0iR2ltcCAyLjEwIChXaW5kb3dzKSIKICAgICAgc3RFdnQ6d2hlbj0iMjAyNC0wMy0yOVQwOTowNDo0MCIvPgogICAgPC9yZGY6U2VxPgogICA8L3htcE1NOkhpc3Rvcnk+CiAgPC9yZGY6RGVzY3JpcHRpb24+CiA8L3JkZjpSREY+CjwveDp4bXBtZXRhPgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgCjw/eHBhY2tldCBlbmQ9InciPz6lj/qJAAAAAmJLR0QA/4ePzL8AAAAJcEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfoAx0NBCiKEThwAAAG8UlEQVR42t2cW2xURRjHf3NWqFRku1yUFQI7FDAUtSUUUzRoQghaUBNijbQ18fIgJj4IvEhifDDRxBdvqAnqA77QaqzRoIJBokGUNlqQgiVcusxK0IKI3XJptbp7fEBkl57dnplzSs/xe9yd75v5z3wz893mCHwjaXEdFcxhJtOYzESilDIKwQD99PIb3Ryji4N08qvK+tWr8EdMwhKreZLpRFw0zvATb9qvpnwBEfEHQOwJ1hPDctXYIsZd4mS6PTArIGEP8zSZ9jBf+dC35csClDJbm2c2pQQGQDnXaPOMZUZwANxsxHVLcABUGXFVBgSANAVQJYMBwLZMVci2AgFAxJlkxDhJxIOxByoMr8MIFcEAUDkCnP4BSJhuYYCqxMgDEJ4AeLdkrnKeVSGppZ/P6R7SXol6uFFnEKV3yEM6zt2MYautUu4ARBH30Uwp8CdfyiY+obcIjGWMMQYwhlreKzL0KPfSwGJKgD5RH9vc48YalTV8wdicH87wGZvs7fw5eAbktbQbGHKX6BAL1FmHfVUiltDIcsbl/HyeJaptSAByGq3c4NDVST6kiTaVyWk7jmaWeVTiLdSrMzkyI9TQwP1c79D2FxaqY0UByKv5iprCly5J3ucDDpBlPPfwDOU+HMNJXuATerCo4AEepLyIl9LKYvVHQQASXuWpoW0HzvEHMecDwJD+pocSrnXhYL3GauUMQJBYzmaf7NPhoyz3pT6znQDICXQwheDTcarU6UFOvYTXuZMw0DgmlG1OD7qJF/EoYaFHxKLLVEhGaGUB4aF2ai4c6BdXoD5Uw4dqGnJWQI6mk5mEi7qYqwYurkBj6IYPM2n8dwVkhA7mEj7qtCtTGQtYGsrhw1yxFCwJqwgrPSERcgqKUSEF8BfSYmVohw+jWGlRR5ipTsized6XfzbjIdpJ0gPEKKea2X4lU/Lo3FXsZ6HPQn/hLZpIKjvH0hXMoJFVjr6eF9ovZA1bKfNNYD8v8rI6V8BNH8ta1nkIAlxOaWrFFEbfwkf+JBs4zIPsVcWDJFW87ykMcImOsmJg3wVbaDIt3O6DhbhMnRq6mZzEFqo99/YtderEv7aQOsFSNnkUeMjd8EGdYhmHPfa2iaXqRI5Hlv6r7GNhc4dx1rKPu5XrpGO6L/Y1DxvfP1mes9ekBi5zKdN2bAdHqDUU+xwtaY3mZSeFxWLDqXqEN1J2obDKQj5EP+1wnBtVnx6LvIaDTNXuqZv7ac1d6rwgiiLVym10aIvdYPfpstjn2aDdTwe3p1rzNdUpNhqlmVoNsRnK1U/6uiCnk9S6nbfQoAbFsh3CWKqXOr7XEHyAY0bafIwDGq2/o045hOId43CqjzXYrkXv1mibp0Xs1mi7VvU7/VEokLiLLtfCk2ZFGwqSrhsfYZfzHwUAKJv9roX/bnwduefcr2wtAGCoFlecCgBICI3s+3jj3t1z3pwQWgDEQma5Fl5uVvOQQCM9MkvcpgFAjuEVDatovpkFJYSGTSp4RZa6BCCjtHCrxkgqmGa0BNOZo9F6AS0yOiQAgUywQzNxF+GhhIkCNWp6ybXskFIMWpr/jzEnoZ7tmJTATGVNQlN7WGMwfIiznXqZt/wXl9QSz7Ke0YYHYo34NH1S4/ys5F1Dz2MUKxBlO9N2ngrJUt6+EK724FIucudSgpzENx4d+008fkFpR8Kpv44tzPfLqQ99WCUyscZw4zrRBB4mEtudHigY2FrHRib71FuM+sgOIXddodBiOQ3DEFpsHa7gbobD/wV3x1NONbOGJ7grZGuR6pTgU5tFC2GmFiGncjTEKaYZFsfZGtr538pxS2EQYAoKbVBYwDY6Qzn8TraBBSrDS6EE8JLK/A+KPSIA6UwszYqQAVitfsh1aJpoD9Xw22nK88hUhrVkQzP8LGsvFuBecil3sjE0ADay08GpD03Z5c9UXiq7zHHqU6dZFQI1yrIqddrBqQeIHWG8C9vU5ixnKPG1xvdvTpNhtIsY3+us73EOq4CCdbQVHXoXLzCPicSJ85hGDqEYJXmMOHEmMo/n6SoaF2/j6SFyZCEvv4dCDyDYbjs/gPieGz2FAaqdHkCIEpbQwD0GDyCgjFjOExSGeIIiV9LsAUCDai4Swch7gkJ97+bBKR3HTaPzCEhG6TYuoOknrjw+AvL8DkrCj8Zlm53c5PVVt+ej0Ia9xsx7vSfiPANIeQKQGnkAYFBb4Z3TVwAHyBjxZbRKDYYPgN3NKSPGU3Z3IACIrEZWP5f2iWwgACjTbbw3OB/G6BipLewXgH1XkGtYACQ5r81zjqPBAdBnUAd6mL7AAFDwjjbTO8qXufPr+0J7OMMsxrmakAwpnufNtC8VST594Qku+0RVnAlX5hNV/wDkVh2zQRBX5QAAAABJRU5ErkJggg=='
-$script:settingsIconBitmap = $null
-try {
-	$stream = [System.IO.MemoryStream]::new([Convert]::FromBase64String($script:settingsIconBase64))
-	$bmp = [System.Windows.Media.Imaging.BitmapImage]::new()
-	$bmp.BeginInit()
-	$bmp.StreamSource = $stream
-	$bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-	$bmp.EndInit()
-	$bmp.Freeze()
-	$script:settingsIconBitmap = $bmp
-} catch {
-	Write-Warning "Could not load the settings gear image; using the built-in fallback. $($_.Exception.Message)"
-}
 
-# --- WPF Settings Dialog ---
-function New-SettingsPage {
-	[xml]$xaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="PrintMaster Scans - Settings" SizeToContent="Height" Width="300" WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
-        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
-$($script:themeResources)
-    <StackPanel Margin="12">
-        <CheckBox Name="chkCreateUser" Content="Create new user account" Margin="0,0,0,6"/>
-        <CheckBox Name="chkHideUser" Content="Hide user from login screen" Margin="0,0,0,6"/>
-        <CheckBox Name="chkCreateFolder" Content="Create scans folder" Margin="0,0,0,6"/>
-        <CheckBox Name="chkSetPermissions" Content="Set folder permissions" Margin="0,0,0,6"/>
-        <CheckBox Name="chkSetShare" Content="Set SMB share" Margin="0,0,0,6"/>
-        <CheckBox Name="chkCreateShortcut" Content="Create desktop shortcut" Margin="0,0,0,6"/>
-        <CheckBox Name="chkNetworkSettings" Content="Check network settings" Margin="0,0,0,6"/>
-        <CheckBox Name="chkNetworkDiscovery" Content="Also enable Network Discovery" Margin="20,0,0,6"
-                  ToolTip="Optional. Only needed when the printer browses the network to find this PC. Typed paths such as \\PC\scans work without it."/>
-        <Button Name="btnOK" Content="OK" Width="75" Height="24" HorizontalAlignment="Right" Margin="0,12,0,0"/>
-    </StackPanel>
-</Window>
-"@
-	$reader = [System.Xml.XmlNodeReader]::new($xaml)
-	$window = [Windows.Markup.XamlReader]::Load($reader)
-	$window.Icon = New-PrintMasterIcon
-	Set-WindowTheme $window
-
-	$window.FindName('chkCreateUser').IsChecked = $script:createUser
-	$window.FindName('chkHideUser').IsChecked = $script:hideUser
-	$window.FindName('chkCreateFolder').IsChecked = $script:createFolder
-	$window.FindName('chkSetPermissions').IsChecked = $script:setPermissions
-	$window.FindName('chkSetShare').IsChecked = $script:setShare
-	$window.FindName('chkCreateShortcut').IsChecked = $script:createShortcut
-	$window.FindName('chkNetworkSettings').IsChecked = $script:checkNetworkSettings
-	$discoveryBox = $window.FindName('chkNetworkDiscovery')
-	$discoveryBox.IsChecked = $script:enableNetworkDiscovery
-	# Discovery is part of the network step, so it is unavailable when that step is off.
-	$discoveryBox.IsEnabled = [bool]$script:checkNetworkSettings
-	$window.FindName('chkNetworkSettings').Add_Checked({ $discoveryBox.IsEnabled = $true })
-	$window.FindName('chkNetworkSettings').Add_Unchecked({ $discoveryBox.IsEnabled = $false })
-	$window.FindName('btnOK').Add_Click({
-		$script:createUser = [bool]$window.FindName('chkCreateUser').IsChecked
-		$script:hideUser = [bool]$window.FindName('chkHideUser').IsChecked
-		$script:createFolder = [bool]$window.FindName('chkCreateFolder').IsChecked
-		$script:setPermissions = [bool]$window.FindName('chkSetPermissions').IsChecked
-		$script:setShare = [bool]$window.FindName('chkSetShare').IsChecked
-		$script:createShortcut = [bool]$window.FindName('chkCreateShortcut').IsChecked
-		$script:checkNetworkSettings = [bool]$window.FindName('chkNetworkSettings').IsChecked
-		$script:enableNetworkDiscovery = $script:checkNetworkSettings -and [bool]$window.FindName('chkNetworkDiscovery').IsChecked
-		$window.DialogResult = $true
-	})
-
-	$window.ShowDialog() | Out-Null
-}
-
-# --- WPF Setup Window ---
-[xml]$setupXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="PrintMaster Scans Setup" Height="250" Width="440" WindowStartupLocation="CenterScreen" ResizeMode="NoResize" ShowInTaskbar="True"
-        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
-$($script:themeResources)
-    <Grid Margin="12">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="75"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <TextBlock Grid.Row="0" Text="Username:" VerticalAlignment="Center" Margin="0,0,0,6"/>
-        <TextBox Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Name="txtUsername" Margin="0,0,0,6"/>
-        <TextBlock Grid.Row="1" Text="Password:" VerticalAlignment="Center" Margin="0,0,0,6"/>
-        <TextBox Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Name="txtPassword" Margin="0,0,0,6"/>
-        <TextBlock Grid.Row="2" Text="Local Dir:" VerticalAlignment="Center" Margin="0,0,0,6"/>
-        <TextBox Grid.Row="2" Grid.Column="1" Name="txtFolderPath" Margin="0,0,4,6"/>
-        <Button Grid.Row="2" Grid.Column="2" Name="btnBrowse" Content="..." Width="28" Margin="0,0,0,6"/>
-        <TextBlock Grid.Row="3" Text="SMB Share:" VerticalAlignment="Center" Margin="0,0,0,6"/>
-        <TextBox Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Name="txtShareName" Margin="0,0,0,6"/>
-        <TextBlock Grid.Row="5" Grid.ColumnSpan="3" Name="txtProvider" Text="Provided by PrintMaster" FontSize="11" VerticalAlignment="Center"/>
-        <StackPanel Grid.Row="5" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnSettings" Width="30" Height="28" Margin="0,0,8,0" ToolTip="Settings">
-                <Grid Width="18" Height="18">
-                    <TextBlock Name="txtSettingsIconFallback" Text="&#x2699;" FontFamily="Segoe UI Symbol" FontSize="18"
-                               Foreground="$($script:thBtnText)" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                    <Rectangle Name="rectSettingsIcon" Width="16" Height="16" Fill="$($script:thBtnText)" Visibility="Collapsed"/>
-                </Grid>
-            </Button>
-            <Button Name="btnOK" Content="OK" Width="75" Height="24" Margin="0,0,8,0" IsDefault="True"/>
-            <Button Name="btnCancel" Content="Cancel" Width="75" Height="24" IsCancel="True"/>
-        </StackPanel>
-    </Grid>
-</Window>
-"@
-$reader = [System.Xml.XmlNodeReader]::new($setupXaml)
-$setupWindow = [Windows.Markup.XamlReader]::Load($reader)
-$setupWindow.Icon = New-PrintMasterIcon
-Set-WindowTheme $setupWindow
-
-# Apply gear icon as OpacityMask so it picks up the theme fill color
-if ($script:settingsIconBitmap) {
-	$brush = [System.Windows.Media.ImageBrush]::new($script:settingsIconBitmap)
-	$settingsIcon = $setupWindow.FindName('rectSettingsIcon')
-	$settingsIcon.OpacityMask = $brush
-	$settingsIcon.Visibility = 'Visible'
-	$setupWindow.FindName('txtSettingsIconFallback').Visibility = 'Collapsed'
-}
-
-$setupWindow.FindName('txtUsername').Text = $scanUser
-$setupWindow.FindName('txtPassword').Text = New-ScanPassphrase
-$setupWindow.FindName('txtFolderPath').Text = $folderPath
-$setupWindow.FindName('txtShareName').Text = $shareName
-
-$setupWindow.FindName('btnBrowse').Add_Click({
-	$folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
-	$folderBrowser.Description = "Select folder for scans"
-	$folderBrowser.SelectedPath = $setupWindow.FindName('txtFolderPath').Text
-	$folderBrowser.ShowNewFolderButton = $true
-	if ($folderBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-		$setupWindow.FindName('txtFolderPath').Text = $folderBrowser.SelectedPath
-	}
-})
-
-$setupWindow.FindName('btnSettings').Add_Click({ New-SettingsPage })
-$setupWindow.FindName('btnOK').Add_Click({ $setupWindow.DialogResult = $true })
-
-$setupResult = $setupWindow.ShowDialog()
-
-if ($setupResult -eq $true) {
-	$script:scanUser = $setupWindow.FindName('txtUsername').Text
-	$script:scanPass = $setupWindow.FindName('txtPassword').Text
-	$script:folderPath = $setupWindow.FindName('txtFolderPath').Text
-	$script:shareName = $setupWindow.FindName('txtShareName').Text
-	Write-Verbose "Username: $script:scanUser `nLocal Dir: $script:folderPath`nSMB Share: $script:shareName"
-}
-else {
-	Write-Verbose "User canceled scanning setup"
-	Exit 0
-}
-$details = New-Object System.Collections.ArrayList
-$script:progressMax = 2
-if ($createUser) { $script:progressMax += 2 }
-if ($hideUser) { $script:progressMax += 1 }
-if ($createFolder) { $script:progressMax += 1 }
-if ($setPermissions) { $script:progressMax += 1 }
-if ($setShare) { $script:progressMax += 1 }
-if ($createShortcut) { $script:progressMax += 1 }
-if ($checkNetworkSettings) { $script:progressMax += 3 }
-
-[xml]$progressXaml = @"
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        Title="PrintMaster Scans Setup - Loading..." Height="300" Width="440" WindowStartupLocation="CenterScreen" ResizeMode="NoResize" ShowInTaskbar="True"
-        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
-$($script:themeResources)
-    <Grid Margin="12">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Name="txtStatus" Text="Loading..." Margin="0,0,0,6"/>
-        <ProgressBar Grid.Row="1" Name="progressBar" Height="20" Minimum="0" Value="0" Margin="0,0,0,6"/>
-        <ListBox Grid.Row="2" Name="lstDetails" Margin="0,0,0,8"/>
-        <TextBlock Grid.Row="3" Name="txtProvider" Text="Provided by PrintMaster" FontSize="11" VerticalAlignment="Center"/>
-        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button Name="btnCopyPassword" Content="Copy Password" Width="110" Height="24" IsEnabled="False" Margin="0,0,8,0"/>
-            <Button Name="btnDone" Content="Done" Width="75" Height="24" IsEnabled="False"/>
-        </StackPanel>
-    </Grid>
-</Window>
-"@
-$reader = [System.Xml.XmlNodeReader]::new($progressXaml)
-$script:progressWindow = [Windows.Markup.XamlReader]::Load($reader)
-$script:progressWindow.Icon = New-PrintMasterIcon
-Set-WindowTheme $script:progressWindow
-$script:progressWindow.FindName('progressBar').Maximum = $script:progressMax
-
-# Prevent closing during work
-$script:progressWindow.Add_Closing({
-	if (-not $script:progressWindow.FindName('btnDone').IsEnabled) {
-		$_.Cancel = $true
-	}
-})
-
-$script:progressWindow.FindName('btnCopyPassword').Add_Click({
-	if ($script:hasSetClipboard) {
-		Set-Clipboard -Value $scanPass
-	}
-	else {
-		[System.Windows.Forms.Clipboard]::SetText($scanPass)
-	}
-	Write-Verbose "Copied scan password to clipboard"
-	Show-ScanMessage -Title 'Password Copied' -Message 'Password has been copied to Clipboard' -Owner $script:progressWindow | Out-Null
-})
-
-$script:progressWindow.FindName('btnDone').Add_Click({
-	$script:progressWindow.Close()
-})
-
-$script:progressWindow.Show()
-$script:percent = 0
-$script:hasErrors = $false
+# --- Setup engine ---
+# Setup runs in one wizard window (Configure, Review, Apply, Done). The functions
+# below keep the work testable without UI: configuration is a plain object, step
+# results are recorded as data, and the wizard only renders what they return.
 
 function Get-ErrorRemediation([string]$errorText) {
 	switch -Regex ($errorText) {
@@ -1744,20 +1860,36 @@ function Get-ErrorRemediation([string]$errorText) {
 	}
 }
 
-function Set-ProgressBar($text, $sleep = 250) {
-	$script:progressWindow.FindName('txtStatus').Text = $text
-	$script:percent += 1
-	$script:progressWindow.FindName('progressBar').Value = [Math]::Min($script:percent, $script:progressMax)
-	$script:details.Insert(0, $text) | Out-Null
-	$script:progressWindow.FindName('lstDetails').Items.Insert(0, $text) | Out-Null
-	Write-Verbose "Progress Text: $text"
+function Update-ScanUi {
+	# Setup work runs on the UI thread; let WPF render queued changes between steps.
 	[System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+}
+
+function Set-ProgressBar($text, $sleep = 250) {
+	$window = $script:progressWindow
+	$window.FindName('txtStatus').Text = $text
+	$script:percent += 1
+	$window.FindName('progressBar').Value = [Math]::Min($script:percent, $script:progressMax)
+	$window.FindName('lstDetails').Items.Insert(0, $text) | Out-Null
+	Write-Verbose "Progress: $text"
+	Update-ScanUi
 	Start-Sleep -Milliseconds $sleep
 }
 
-function Show-StepResult($result) {
+function Show-StepResult {
+	<#
+	.SYNOPSIS
+		Reports a step on the Apply page and records it for the Done page.
+	.DESCRIPTION
+		Failures no longer interrupt setup with modal popups; the Done page lists
+		each failure with its error and remediation tip instead.
+	#>
+	param($result, [string]$Category = 'General')
 	Set-ProgressBar $result.Message
-	if ($result.Error) {
+	$status = if ($result.Error -or $result.Status -eq 'Failed') { 'Failed' } elseif ($result.Status) { $result.Status } else { 'Success' }
+	if ($result.Optional) { $Category = 'Optional' }
+	$tip = $null
+	if ($status -eq 'Failed') {
 		$script:hasErrors = $true
 		Set-ProgressBar "  Error: $($result.Error)" 0
 		$tip = Get-ErrorRemediation "$($result.ErrorId) $($result.Error)"
@@ -1765,141 +1897,1224 @@ function Show-StepResult($result) {
 			$tip = 'Review the error details and correct the reported issue, then run setup again. If the problem persists, share the error details with your administrator.'
 		}
 		Set-ProgressBar "  Tip: $tip" 0
-		$title = 'Scans Setup - Step Failed'
-		$message = "$($result.Message)`n`n$($result.Error)"
-		if ($result.ErrorId -match 'InvalidPassword') {
-			$title = 'Scan Account Password Rejected'
-			$message = "Windows rejected the password for the scan account. It may not meet the effective local or domain password policy."
-		}
-		Show-ErrorPopup -Owner $script:progressWindow -Title $title -Message $message -Remediation $tip
+		Write-Warning "Setup step failed [$Category]: $($result.Message) $($result.Error)"
+	}
+	if ($null -eq $script:stepResults) { $script:stepResults = New-Object System.Collections.ArrayList }
+	[void]$script:stepResults.Add([pscustomobject]@{
+		Category = $Category
+		Status   = $status
+		Message  = [string]$result.Message
+		Error    = $result.Error
+		Tip      = $tip
+	})
+}
+
+function New-ScanSetupConfiguration {
+	# Snapshot of the script defaults; the wizard edits a copy, never the globals.
+	return [pscustomobject]@{
+		Username        = $script:scanUser
+		FolderPath      = $script:folderPath
+		ShareName       = $script:shareName
+		Description     = $script:description
+		CreateUser      = [bool]$script:createUser
+		HideUser        = [bool]$script:hideUser
+		CreateFolder    = [bool]$script:createFolder
+		SetPermissions  = [bool]$script:setPermissions
+		SetShare        = [bool]$script:setShare
+		CreateShortcut  = [bool]$script:createShortcut
+		CheckNetwork    = [bool]$script:checkNetworkSettings
+		EnableDiscovery = [bool]$script:enableNetworkDiscovery
 	}
 }
 
-function Show-PasswordRetryDialog {
-	param([string]$ErrorText)
+function Test-ScanAccountStepSelected {
+	# Hiding the account also runs account setup, which sets its password.
+	param($Configuration)
+	return [bool]($Configuration.CreateUser -or $Configuration.HideUser)
+}
 
-	$passwordRetryContent = @'
-    <StackPanel>
-        <TextBlock Text="Windows rejected the scan-account password. Setup is paused." TextWrapping="Wrap" Margin="0,0,0,8"/>
-        <TextBlock Name="txtError" TextWrapping="Wrap" Margin="0,0,0,8"/>
-        <TextBlock Name="txtRemediation" TextWrapping="Wrap" Margin="0,0,0,12"/>
-        <TextBlock Text="New password:" Margin="0,0,0,6"/>
-        <DockPanel Margin="0,0,0,12">
-            <Button DockPanel.Dock="Right" Name="btnGenerate" Content="Generate" Width="85" Margin="8,0,0,0"/>
-            <TextBox Name="txtPassword"/>
-        </DockPanel>
-        <TextBlock Text="Retry resumes account setup before any remaining steps. Cancel stops setup." TextWrapping="Wrap" Margin="0,0,0,12"/>
-    </StackPanel>
-'@
-	$passwordWindow = New-ScanDialog -Title 'Password Rejected' -ContentXaml $passwordRetryContent `
-		-AcceptText 'Retry' -CancelText 'Cancel setup' -Owner $script:progressWindow
-	$passwordWindow.FindName('txtError').Text = $ErrorText
-	$passwordWindow.FindName('txtRemediation').Text = $script:Remediation.PasswordPolicy
-	$passwordWindow.FindName('txtPassword').Add_TextChanged({
-		$passwordWindow.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($passwordWindow.FindName('txtPassword').Text)
-	})
-	$passwordWindow.FindName('txtPassword').Text = $script:scanPass
-	$passwordWindow.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($script:scanPass)
-	$passwordWindow.FindName('btnGenerate').Add_Click({
-		$passwordWindow.FindName('txtPassword').Text = New-ScanPassphrase
-	})
-	if ($passwordWindow.ShowDialog() -eq $true) {
-		return $passwordWindow.FindName('txtPassword').Text
+function Test-ScanWizardConfiguration {
+	<#
+	.SYNOPSIS
+		Returns user-facing problems with the Configure page; empty when valid.
+	.DESCRIPTION
+		PasswordPresent is checked by length only so validation never needs plaintext.
+	#>
+	param($Configuration, [bool]$PasswordPresent)
+	$problems = New-Object System.Collections.Generic.List[string]
+	$name = [string]$Configuration.Username
+	if ([string]::IsNullOrWhiteSpace($name)) {
+		$problems.Add('Enter a scan account name.')
 	}
-	return $null
-}
-
-# Gather computer details
-Set-ProgressBar "Gathering local computer details"
-if ($script:hasCimInstance) {
-	$computerDetails = Get-CimInstance -ClassName Win32_ComputerSystem
-}
-else {
-	$computerDetails = Get-WmiObject -Class Win32_ComputerSystem
-}
-$domainJoined = $computerDetails.PartOfDomain
-
-# Create/update scans user account and hide from login screen
-$scanUserConfigured = $true
-$setupCancelled = $false
-$setupCancelReason = 'password rejection'
-if ($createUser -or $hideUser) {
-	do {
-		$userResults = @(Initialize-ScanUser -Username $scanUser -Password $scanPass -Description $description -HideFromLogin $hideUser -DomainJoined $domainJoined)
-		$accountCancellation = $userResults | Where-Object { $_.SetupCanceled } | Select-Object -First 1
-		if ($accountCancellation) {
-			$setupCancelled = $true
-			$setupCancelReason = 'existing account confirmation was declined'
-			break
+	elseif ($name.Length -gt 20) {
+		$problems.Add('Scan account names can be at most 20 characters.')
+	}
+	elseif ($name -match '["/\\\[\]:;|=,+*?<>@]' -or $name -ne $name.Trim() -or $name -match '^\.+$') {
+		$problems.Add('Scan account names cannot contain " / \ [ ] : ; | = , + * ? < > @, start or end with a space, or be only periods.')
+	}
+	if ((Test-ScanAccountStepSelected -Configuration $Configuration) -and -not $PasswordPresent) {
+		$problems.Add('Enter or generate a password for the scan account.')
+	}
+	if ($Configuration.CreateFolder -or $Configuration.SetShare -or $Configuration.CreateShortcut) {
+		$path = [string]$Configuration.FolderPath
+		if ($path -notmatch '^[A-Za-z]:\\' -or $path.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or $path.IndexOfAny([char[]]'*?"<>|') -ge 0) {
+			$problems.Add('Enter a full local folder path, such as C:\scans.')
 		}
-		$passwordFailure = $userResults | Where-Object { $_.AccountSetupFailed -and ($_.ErrorId -match 'InvalidPassword' -or $_.Error -match '\b2245\b') } | Select-Object -First 1
-		if ($passwordFailure) {
-			$newPassword = Show-PasswordRetryDialog -ErrorText $passwordFailure.Error
-			if ($null -eq $newPassword) {
-				$setupCancelled = $true
+	}
+	if ($Configuration.SetShare) {
+		$share = [string]$Configuration.ShareName
+		if ([string]::IsNullOrWhiteSpace($share)) {
+			$problems.Add('Enter a share name.')
+		}
+		elseif ($share.Length -gt 80 -or $share -match '["/\\\[\]:|<>+=;,*?]') {
+			$problems.Add('Share names can be up to 80 characters and cannot contain " / \ [ ] : | < > + = ; , * ?')
+		}
+	}
+	# Callers wrap the result in @(); an empty list then means valid.
+	return $problems.ToArray()
+}
+
+function Get-ScanReviewGate {
+	<#
+	.SYNOPSIS
+		Decides whether Apply is allowed and what the Review page must say about
+		the scan account. Administrators and failed checks block Apply; an existing
+		account requires explicit confirmation.
+	#>
+	param($Configuration, $AccountState, [bool]$Confirmed)
+	$gate = [pscustomobject]@{ CanApply = $true; NeedsConfirmation = $false; Notice = $null; Tone = $null }
+	if (-not (Test-ScanAccountStepSelected -Configuration $Configuration) -or -not $AccountState) { return $gate }
+	$name = $Configuration.Username
+	if ($AccountState.CheckFailed) {
+		$gate.CanApply = $false
+		$gate.Tone = 'Danger'
+		$gate.Notice = "Could not check whether '$name' already exists or is an administrator: $($AccountState.Message) Go back and try again, or choose another name."
+	}
+	elseif ($AccountState.IsAdministrator) {
+		$gate.CanApply = $false
+		$gate.Tone = 'Danger'
+		$gate.Notice = "'$name' is a member of the local Administrators group. Scans will not change its password. Go back and choose a different account name."
+	}
+	elseif ($AccountState.Exists) {
+		$gate.NeedsConfirmation = $true
+		$gate.CanApply = $Confirmed
+		$gate.Tone = 'Warn'
+		$gate.Notice = "A local account named '$name' already exists. Applying changes its password, which affects anything else that signs in with it."
+	}
+	return $gate
+}
+
+function Get-ScanSetupReview {
+	# Rows for the Review page: what will change, in plain language.
+	param($Configuration, $AccountState, [string]$ComputerName = $env:COMPUTERNAME)
+	$c = $Configuration
+	$accountStep = Test-ScanAccountStepSelected -Configuration $c
+	$exists = $AccountState -and $AccountState.Exists
+	$unchanged = 'Not changed'
+	$rows = New-Object System.Collections.ArrayList
+	$account = if (-not $accountStep) { "$unchanged (uses existing '$($c.Username)')" }
+		elseif ($exists) { "Update existing local account '$($c.Username)' and change its password" }
+		else { "Create local account '$($c.Username)'" }
+	[void]$rows.Add([pscustomobject]@{ Label = 'Scan account'; Value = $account; Tone = $(if ($exists -and $accountStep) { 'Warn' } elseif ($accountStep) { 'Normal' } else { 'Muted' }) })
+	[void]$rows.Add([pscustomobject]@{ Label = 'Password'; Value = $(if ($accountStep) { 'Set from the Configure page (hidden)' } else { $unchanged }); Tone = $(if ($accountStep) { 'Normal' } else { 'Muted' }) })
+	[void]$rows.Add([pscustomobject]@{ Label = 'Sign-in screen'; Value = $(if ($c.HideUser) { "Hide '$($c.Username)' (skipped on domain-joined PCs)" } else { $unchanged }); Tone = $(if ($c.HideUser) { 'Normal' } else { 'Muted' }) })
+	[void]$rows.Add([pscustomobject]@{ Label = 'Scans folder'; Value = $(if ($c.CreateFolder) { "Create or reuse $($c.FolderPath)" } else { $unchanged }); Tone = $(if ($c.CreateFolder) { 'Normal' } else { 'Muted' }) })
+	$permissions = $c.CreateFolder -and $c.SetPermissions
+	[void]$rows.Add([pscustomobject]@{ Label = 'Folder access'; Value = $(if ($permissions) { "Least-privilege access for '$($c.Username)'; you review it before anything changes" } else { $unchanged }); Tone = $(if ($permissions) { 'Normal' } else { 'Muted' }) })
+	[void]$rows.Add([pscustomobject]@{ Label = 'SMB share'; Value = $(if ($c.SetShare) { "Share as \\$ComputerName\$($c.ShareName)" } else { $unchanged }); Tone = $(if ($c.SetShare) { 'Normal' } else { 'Muted' }) })
+	[void]$rows.Add([pscustomobject]@{ Label = 'Desktop shortcut'; Value = $(if ($c.CreateShortcut) { 'Add a shortcut to the scans folder' } else { 'Not added' }); Tone = $(if ($c.CreateShortcut) { 'Normal' } else { 'Muted' }) })
+	$network = if (-not $c.CheckNetwork) { $unchanged }
+		elseif ($c.EnableDiscovery) { 'Private network profile, File and Printer Sharing, and Network Discovery' }
+		else { 'Private network profile and File and Printer Sharing' }
+	[void]$rows.Add([pscustomobject]@{ Label = 'Network'; Value = $network; Tone = $(if ($c.CheckNetwork) { 'Normal' } else { 'Muted' }) })
+	return $rows.ToArray()
+}
+
+function Get-ScanProgressMaximum {
+	param($Configuration)
+	$c = $Configuration
+	$maximum = 2
+	if ($c.CreateUser) { $maximum += 2 }
+	if ($c.HideUser) { $maximum += 1 }
+	if ($c.CreateFolder) { $maximum += 1 }
+	if ($c.SetPermissions) { $maximum += 1 }
+	if ($c.SetShare) { $maximum += 1 }
+	if ($c.CreateShortcut) { $maximum += 1 }
+	if ($c.CheckNetwork) { $maximum += 3 }
+	return $maximum
+}
+
+function Get-ScanComputerIdentity {
+	# Names the printer can use to reach this PC. FQDN is only reported when
+	# Windows has a DNS suffix; it is never guessed.
+	$computerSystem = $null
+	try {
+		if ($script:hasCimInstance) { $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem }
+		else { $computerSystem = Get-WmiObject -Class Win32_ComputerSystem }
+	}
+	catch {
+		Write-Warning "Could not read computer details; assuming the PC is not domain joined. $($_.Exception.Message)"
+	}
+	$hostName = $env:COMPUTERNAME
+	$dnsDomain = $null
+	try {
+		$ipProperties = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+		if ($ipProperties.HostName) { $hostName = $ipProperties.HostName }
+		$dnsDomain = $ipProperties.DomainName
+	}
+	catch {
+		Write-Verbose "DNS host details unavailable: $($_.Exception.Message)"
+	}
+	return [pscustomobject]@{
+		ComputerName = $env:COMPUTERNAME
+		HostName     = $hostName
+		Fqdn         = $(if ($dnsDomain) { "$hostName.$dnsDomain" } else { $null })
+		DomainJoined = [bool]($computerSystem -and $computerSystem.PartOfDomain)
+	}
+}
+
+function New-ScanSetupResult {
+	param($Configuration)
+	return [pscustomobject]@{
+		Canceled          = $false
+		CancelReason      = $null
+		AccountStepRan    = $false
+		AccountConfigured = $false
+		Password          = $null
+		ShareName         = $Configuration.ShareName
+		ShareConfigured   = $false
+		Identity          = $null
+		Steps             = @()
+	}
+}
+
+function Invoke-ScanSetup {
+	<#
+	.SYNOPSIS
+		Applies the configuration and returns a result for the Done page.
+	.DESCRIPTION
+		Order matters: the account comes first because folder permissions and the
+		share are granted to it. A rejected password pauses here for a replacement;
+		declining an existing-account change or the replacement stops all remaining
+		steps. Result.Password is set only when this run set the account password.
+	#>
+	param($Configuration, [System.Security.SecureString]$Password)
+	$c = $Configuration
+	$result = New-ScanSetupResult -Configuration $c
+	$script:stepResults = New-Object System.Collections.ArrayList
+	$script:hasErrors = $false
+	$script:percent = 0
+	$script:progressMax = Get-ScanProgressMaximum -Configuration $c
+	$window = $script:progressWindow
+	$window.FindName('progressBar').Maximum = $script:progressMax
+	$window.FindName('progressBar').Value = 0
+	$window.FindName('lstDetails').Items.Clear()
+	Write-Verbose ("Starting setup: account '{0}', folder '{1}', share '{2}'; user={3} hide={4} folder={5} permissions={6} share={7} shortcut={8} network={9} discovery={10}" -f
+		$c.Username, $c.FolderPath, $c.ShareName, $c.CreateUser, $c.HideUser, $c.CreateFolder, $c.SetPermissions, $c.SetShare, $c.CreateShortcut, $c.CheckNetwork, $c.EnableDiscovery)
+
+	Set-ProgressBar 'Gathering local computer details'
+	$result.Identity = Get-ScanComputerIdentity
+	$domainJoined = $result.Identity.DomainJoined
+
+	# Without the account step, assume the named account already exists.
+	$accountConfigured = $true
+	$accountCancellation = $null
+	$currentPassword = $Password
+	if (Test-ScanAccountStepSelected -Configuration $c) {
+		$result.AccountStepRan = $true
+		do {
+			$userResults = @(Initialize-ScanUser -Username $c.Username -Password $currentPassword -Description $c.Description -HideFromLogin $c.HideUser -DomainJoined $domainJoined)
+			$accountCancellation = $userResults | Where-Object { $_.SetupCanceled } | Select-Object -First 1
+			if ($accountCancellation) {
+				$result.Canceled = $true
+				$result.CancelReason = 'the existing account change was declined'
 				break
 			}
-			$script:scanPass = $newPassword
-		}
-	} while ($passwordFailure)
-	if (-not $setupCancelled) {
-		foreach ($r in $userResults) { Show-StepResult $r }
-	}
-	$scanUserConfigured = @($userResults | Where-Object { $_.AccountSetupFailed }).Count -eq 0
-}
-
-if ($setupCancelled) {
-	if ($accountCancellation) { Show-StepResult $accountCancellation }
-	Set-ProgressBar "Setup canceled because $setupCancelReason; remaining steps were not run." 0
-	$script:progressWindow.Title = 'PrintMaster Scans Setup - Canceled'
-}
-else {
-	if (-not $scanUserConfigured) {
-		Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped scan-user folder permissions and SMB share configuration because account setup failed'; Error = $null }
-	}
-
-	$scanFolderConfigured = $true
-	if ($createFolder -eq $true) {
-		$folderResults = @(Initialize-ScanFolder -FolderPath $folderPath -ScanUser $scanUser -SetPermissions ($setPermissions -and $scanUserConfigured) -DomainJoined $domainJoined)
-		foreach ($r in $folderResults) { Show-StepResult $r }
-		$scanFolderConfigured = @($folderResults | Where-Object { $_.FolderSetupFailed }).Count -eq 0
-		if (-not $scanFolderConfigured) {
-			Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped SMB share configuration because folder setup failed or was canceled'; Error = $null }
+			$passwordFailure = $userResults | Where-Object { $_.AccountSetupFailed -and ($_.ErrorId -match 'InvalidPassword' -or $_.Error -match '\b2245\b') } | Select-Object -First 1
+			if ($passwordFailure) {
+				Write-Verbose 'Windows rejected the scan account password; asking for a replacement.'
+				$replacement = Request-ScanReplacementPassword -ErrorText $passwordFailure.Error
+				if ($null -eq $replacement) {
+					$result.Canceled = $true
+					$result.CancelReason = 'password correction was canceled'
+					break
+				}
+				# Dispose superseded replacements, never the caller's original.
+				if (-not [object]::ReferenceEquals($currentPassword, $Password)) { $currentPassword.Dispose() }
+				$currentPassword = $replacement
+			}
+		} while ($passwordFailure)
+		if (-not $result.Canceled) {
+			foreach ($r in $userResults) { Show-StepResult $r -Category 'Account' }
+			$accountConfigured = @($userResults | Where-Object { $_.AccountSetupFailed }).Count -eq 0
+			$result.AccountConfigured = $accountConfigured
 		}
 	}
 
-	if ($setShare -eq $true -and $scanUserConfigured -and $scanFolderConfigured) {
-		$shareResult = Initialize-ScanShare -ShareName $shareName -FolderPath $folderPath -ScanUser $scanUser
-		if ($shareResult.Status -eq 'Success') { $script:shareName = $shareResult.ShareName }
-		Show-StepResult $shareResult
-	}
-
-	if ($createShortcut -eq $true) {
-		$shortcutResult = Initialize-DesktopShortcut -FolderPath $folderPath -IconPath $iconPath -Description $description
-		Show-StepResult $shortcutResult
-	}
-
-	if ($checkNetworkSettings -eq $true) {
-		$netResults = Set-NetworkConfiguration -DomainJoined $domainJoined -EnableDiscovery $enableNetworkDiscovery
-		foreach ($r in $netResults) { Show-StepResult $r }
-	}
-
-	Set-ProgressBar "Finished" 0
-	$script:progressWindow.FindName('progressBar').Value = $script:progressMax
-	if ($script:hasErrors) {
-		$script:progressWindow.Title = 'PrintMaster Scans Setup - Completed with errors'
-		$script:progressWindow.FindName('txtStatus').Text = 'Completed with errors (see details above)'
+	if ($result.Canceled) {
+		if ($accountCancellation) { Show-StepResult $accountCancellation -Category 'Account' }
+		else { Show-StepResult @{ Status = 'Skipped'; Message = 'Password correction canceled; the scan account was not changed.'; Error = $null } -Category 'Account' }
+		Set-ProgressBar "Setup canceled because $($result.CancelReason); remaining steps were not run." 0
 	}
 	else {
-		$script:progressWindow.Title = 'PrintMaster Scans Setup - Finished'
+		if (-not $accountConfigured) {
+			Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped scan-user folder permissions and SMB share configuration because account setup failed'; Error = $null } -Category 'Account'
+		}
+
+		$scanFolderConfigured = $true
+		if ($c.CreateFolder) {
+			$folderResults = @(Initialize-ScanFolder -FolderPath $c.FolderPath -ScanUser $c.Username -SetPermissions ($c.SetPermissions -and $accountConfigured) -DomainJoined $domainJoined)
+			foreach ($r in $folderResults) { Show-StepResult $r -Category 'Folder' }
+			$scanFolderConfigured = @($folderResults | Where-Object { $_.FolderSetupFailed }).Count -eq 0
+			if (-not $scanFolderConfigured) {
+				Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped SMB share configuration because folder setup failed or was canceled'; Error = $null } -Category 'Folder'
+			}
+		}
+
+		if ($c.SetShare -and $accountConfigured -and $scanFolderConfigured) {
+			$shareResult = Initialize-ScanShare -ShareName $c.ShareName -FolderPath $c.FolderPath -ScanUser $c.Username
+			if ($shareResult.Status -eq 'Success') {
+				$result.ShareConfigured = $true
+				if ($shareResult.ShareName) { $result.ShareName = $shareResult.ShareName }
+			}
+			Show-StepResult $shareResult -Category 'Share'
+		}
+
+		if ($c.CreateShortcut) {
+			Show-StepResult (Initialize-DesktopShortcut -FolderPath $c.FolderPath -IconPath $script:iconPath -Description $c.Description) -Category 'Shortcut'
+		}
+
+		if ($c.CheckNetwork) {
+			$netResults = Set-NetworkConfiguration -DomainJoined $domainJoined -EnableDiscovery $c.EnableDiscovery
+			foreach ($r in $netResults) { Show-StepResult $r -Category 'Network' }
+		}
+
+		Set-ProgressBar 'Finished' 0
+		$window.FindName('progressBar').Value = $script:progressMax
+	}
+
+	if ($result.AccountConfigured) {
+		$result.Password = $currentPassword
+	}
+	elseif (-not [object]::ReferenceEquals($currentPassword, $Password)) {
+		$currentPassword.Dispose()
+	}
+	$result.Steps = @($script:stepResults)
+	$failedCount = @($result.Steps | Where-Object { $_.Status -eq 'Failed' }).Count
+	Write-Verbose "Setup run complete: canceled=$($result.Canceled), failed steps=$failedCount, password set=$([bool]$result.Password)."
+	return $result
+}
+
+function Get-ScanSetupOutcome {
+	<#
+	.SYNOPSIS
+		Summarizes a run. Only a run without required-step failures may be called ready.
+	#>
+	param($Result)
+	# Steps whose failure does not stop the PC from receiving scans.
+	$optionalCategories = @('Shortcut', 'Optional')
+	$prerequisiteNames = @{
+		Account = 'scan account'
+		Folder  = 'scans folder and permissions'
+		Share   = 'SMB share'
+		Network = 'network and firewall settings'
+		General = 'setup'
+	}
+	$failed = @($Result.Steps | Where-Object { $_.Status -eq 'Failed' })
+	$failedRequired = @($failed | Where-Object { $optionalCategories -notcontains $_.Category })
+	$names = @($failedRequired | ForEach-Object {
+		if ($prerequisiteNames.ContainsKey($_.Category)) { $prerequisiteNames[$_.Category] } else { $_.Category }
+	} | Select-Object -Unique)
+	if ($Result.Canceled) {
+		return [pscustomobject]@{ State = 'Canceled'; Title = 'Setup canceled'; FailedPrerequisites = @()
+			Message = "Setup stopped because $($Result.CancelReason). Later steps were not run, so this PC is not ready to receive scans." }
+	}
+	if ($failedRequired.Count) {
+		return [pscustomobject]@{ State = 'NotReady'; Title = 'Not ready for scanning'; FailedPrerequisites = $names
+			Message = "These required parts failed: $($names -join ', '). Fix the problems below, then use Back to setup to run it again." }
+	}
+	if ($failed.Count) {
+		return [pscustomobject]@{ State = 'Warning'; Title = 'Ready, with optional problems'; FailedPrerequisites = @()
+			Message = 'The required steps finished, but an optional step failed. Details are below.' }
+	}
+	return [pscustomobject]@{ State = 'Ready'; Title = 'Ready for scanning'; FailedPrerequisites = @()
+		Message = "All selected steps finished. Enter these details in the printer's scan-to-folder settings." }
+}
+
+function Get-ScanNetworkAddresses {
+	<#
+	.SYNOPSIS
+		Usable IPv4 addresses by adapter. Excludes down and loopback/tunnel
+		interfaces, loopback addresses, and 169.254.x.x link-local addresses.
+	#>
+	param([object[]]$Interfaces)
+	if (-not $PSBoundParameters.ContainsKey('Interfaces')) {
+		try { $Interfaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() }
+		catch {
+			Write-Warning "Could not list network adapters: $($_.Exception.Message)"
+			return @()
+		}
+	}
+	$addresses = foreach ($adapter in $Interfaces) {
+		if ("$($adapter.OperationalStatus)" -ne 'Up') { continue }
+		if (@('Loopback', 'Tunnel') -contains "$($adapter.NetworkInterfaceType)") { continue }
+		foreach ($unicast in $adapter.GetIPProperties().UnicastAddresses) {
+			if ("$($unicast.Address.AddressFamily)" -ne 'InterNetwork') { continue }
+			$text = $unicast.Address.IPAddressToString
+			if ($text -like '127.*' -or $text -like '169.254.*') { continue }
+			[pscustomobject]@{ Adapter = [string]$adapter.Name; Address = $text }
+		}
+	}
+	return @($addresses)
+}
+
+function Get-ScanConnectionDetails {
+	<#
+	.SYNOPSIS
+		Rows for the Done page, each with a stable Key used by its Copy button.
+	.DESCRIPTION
+		Values come only from this run and this PC; anything unknown says so
+		rather than being guessed. The password row is Sensitive and carries no value.
+	#>
+	param(
+		$Identity,
+		[string]$Username,
+		[string]$ShareName,
+		[bool]$ShareConfigured,
+		[string]$FolderPath,
+		[object[]]$Addresses = @(),
+		[bool]$PasswordAvailable
+	)
+	$rows = New-Object System.Collections.ArrayList
+	function Add-ScanConnectionRow([string]$Key, [string]$Label, [string]$Value, [bool]$CanCopy = $true, [string]$Hint, [bool]$Sensitive = $false) {
+		[void]$rows.Add([pscustomobject]@{ Key = $Key; Label = $Label; Value = $Value; CanCopy = $CanCopy; Hint = $Hint; Sensitive = $Sensitive })
+	}
+	$computer = $Identity.ComputerName
+	Add-ScanConnectionRow 'username' 'Username' $Username
+	Add-ScanConnectionRow 'qualifiedUsername' 'Username with PC name' "$computer\$Username" -Hint 'Use this form if the printer has no separate domain field.'
+	if ($PasswordAvailable) {
+		Add-ScanConnectionRow 'password' 'Password' '' -Sensitive $true -Hint 'Hidden. Show reveals it; Copy keeps it out of clipboard history.'
+	}
+	else {
+		Add-ScanConnectionRow 'password' 'Password' 'Unknown: not set in this run' -CanCopy $false -Hint "Use the account's existing password."
+	}
+	Add-ScanConnectionRow 'domain' 'Domain' $computer -Hint 'Local account, so the domain is this PC name.'
+	Add-ScanConnectionRow 'hostName' 'Host name' $computer
+	if ($Identity.Fqdn) { Add-ScanConnectionRow 'fqdn' 'Full host name (FQDN)' $Identity.Fqdn }
+	else { Add-ScanConnectionRow 'fqdn' 'Full host name (FQDN)' 'Not available: no DNS suffix' -CanCopy $false }
+	if ($ShareConfigured) {
+		Add-ScanConnectionRow 'shareName' 'Share name' $ShareName
+		Add-ScanConnectionRow 'pathHost' 'Network path' "\\$computer\$ShareName"
+		$index = 0
+		foreach ($address in $Addresses) {
+			Add-ScanConnectionRow "pathIp$index" "Network path by IP ($($address.Adapter))" "\\$($address.Address)\$ShareName"
+			$index++
+		}
+	}
+	else {
+		Add-ScanConnectionRow 'shareName' 'Share' 'Not configured in this run' -CanCopy $false -Hint 'Network paths need a working SMB share.'
+	}
+	if ($Addresses.Count) {
+		$index = 0
+		foreach ($address in $Addresses) {
+			Add-ScanConnectionRow "ip$index" "IPv4 address ($($address.Adapter))" $address.Address -Hint 'Alternative to the host name. DHCP addresses can change.'
+			$index++
+		}
+	}
+	else {
+		Add-ScanConnectionRow 'ip' 'IPv4 address' 'No usable IPv4 address found' -CanCopy $false
+	}
+	Add-ScanConnectionRow 'port' 'SMB port' '445'
+	Add-ScanConnectionRow 'localFolder' 'Local folder (this PC)' $FolderPath -Hint 'Where scans land on this PC; not the network path.'
+	return $rows.ToArray()
+}
+
+function Get-ScanSetupSummaryText {
+	# Plain-text report for support or records. Never includes the password.
+	param($Outcome, [object[]]$Details = @(), [object[]]$Steps = @())
+	$lines = New-Object System.Collections.Generic.List[string]
+	$lines.Add("PrintMaster Scans setup: $($Outcome.Title)")
+	$lines.Add($Outcome.Message)
+	if ($Details.Count) {
+		$lines.Add('')
+		$lines.Add('Connection details')
+		foreach ($row in $Details) {
+			$value = if ($row.Sensitive) { '(not included)' } else { $row.Value }
+			$lines.Add("  $($row.Label): $value")
+		}
+	}
+	$lines.Add('')
+	$lines.Add('Steps')
+	foreach ($step in $Steps) {
+		$tag = switch ($step.Status) { 'Success' { 'OK' } 'Failed' { 'FAILED' } default { ([string]$step.Status).ToUpperInvariant() } }
+		$lines.Add("  [$tag] $($step.Message)")
+		if ($step.Error) { $lines.Add("      Error: $($step.Error)") }
+		if ($step.Tip) { $lines.Add("      Fix: $($step.Tip)") }
+	}
+	return ($lines -join [Environment]::NewLine)
+}
+
+# --- Setup wizard window ---
+
+function ConvertTo-ScanBrush([string]$Color) {
+	return [System.Windows.Media.BrushConverter]::new().ConvertFromString($Color)
+}
+
+function Get-ScanToneColor([string]$Tone) {
+	switch ($Tone) {
+		'Success' { return $script:thSuccess }
+		'Warn' { return $script:thWarn }
+		'Danger' { return $script:thDanger }
+		'Muted' { return $script:thFg }
+		default { return $script:thFgStrong }
 	}
 }
-$script:progressWindow.FindName('btnDone').IsEnabled = $true
-if ($createUser -and $scanUserConfigured) { $script:progressWindow.FindName('btnCopyPassword').IsEnabled = $true }
-[System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
 
-# Block until user closes the progress window
-$frame = [System.Windows.Threading.DispatcherFrame]::new()
-$script:progressWindow.Add_Closed({ $frame.Continue = $false })
-[System.Windows.Threading.Dispatcher]::PushFrame($frame)
+function New-ScanWizardWindow {
+	# Source-owned markup only; runtime values are assigned to controls afterwards.
+	[xml]$wizardXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PrintMaster Scans Setup" Width="720" Height="680" MinWidth="620" MinHeight="560"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanResize" ShowInTaskbar="True"
+        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
+$($script:themeResources)
+    <Grid>
+        <Grid.Resources>
+            <Style x:Key="PageTitle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="20"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            </Style>
+            <Style x:Key="SectionTitle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="15"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                <Setter Property="Margin" Value="0,18,0,6"/>
+            </Style>
+            <Style x:Key="Hint" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="TextWrapping" Value="Wrap"/>
+                <Setter Property="Foreground" Value="$($script:thFg)"/>
+            </Style>
+            <Style x:Key="FieldLabel" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                <Setter Property="VerticalAlignment" Value="Center"/>
+                <Setter Property="Margin" Value="0,0,12,0"/>
+            </Style>
+            <Style x:Key="StepTab" TargetType="Border">
+                <Setter Property="BorderThickness" Value="0,0,0,3"/>
+                <Setter Property="BorderBrush" Value="Transparent"/>
+                <Setter Property="Padding" Value="2,0,0,9"/>
+                <Setter Property="Margin" Value="0,0,10,0"/>
+            </Style>
+        </Grid.Resources>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Border Background="$($script:thBgAlt)" BorderBrush="$($script:thBorder)" BorderThickness="0,0,0,1" Padding="22,16,22,0">
+            <StackPanel>
+                <DockPanel>
+                    <Image Name="imgLogo" Width="34" Height="34" Margin="0,0,12,0" VerticalAlignment="Center"/>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="PrintMaster Scans" FontSize="18" FontWeight="SemiBold" Foreground="$($script:thFgStrong)"/>
+                        <TextBlock Text="Set up this PC as a scan-to-folder destination" FontSize="12"/>
+                    </StackPanel>
+                </DockPanel>
+                <UniformGrid Columns="4" Margin="0,16,0,0">
+                    <Border Name="stepConfigure" Style="{StaticResource StepTab}"><TextBlock Name="txtStepConfigure" Text="1   Configure"/></Border>
+                    <Border Name="stepReview" Style="{StaticResource StepTab}"><TextBlock Name="txtStepReview" Text="2   Review"/></Border>
+                    <Border Name="stepApply" Style="{StaticResource StepTab}"><TextBlock Name="txtStepApply" Text="3   Apply"/></Border>
+                    <Border Name="stepDone" Style="{StaticResource StepTab}"><TextBlock Name="txtStepDone" Text="4   Done"/></Border>
+                </UniformGrid>
+            </StackPanel>
+        </Border>
+
+        <ScrollViewer Grid.Row="1" Name="scrollPages" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <Grid Margin="22,18,22,16">
+
+                <StackPanel Name="pageConfigure">
+                    <TextBlock Text="Configure" Style="{StaticResource PageTitle}"/>
+                    <TextBlock Style="{StaticResource Hint}" FontSize="13" Margin="0,4,0,16"
+                               Text="Choose the account and folder the printer will use. Nothing changes on this PC until you review and apply."/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="120"/>
+                            <ColumnDefinition/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="Scan account" Style="{StaticResource FieldLabel}"/>
+                        <TextBox Grid.Column="1" Name="txtUsername" AutomationProperties.Name="Scan account name"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,4,0,12"
+                                   Text="Local Windows account the printer signs in with."/>
+                        <TextBlock Grid.Row="2" Text="Password" Style="{StaticResource FieldLabel}"/>
+                        <ContentControl Grid.Row="2" Grid.Column="1" Focusable="False">
+                            $(Get-ScanPasswordFieldXaml -Prefix 'config' -Label 'Scan account password')
+                        </ContentControl>
+                        <TextBlock Grid.Row="3" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,4,0,12"
+                                   Text="Hidden by default. Generate creates a long passphrase; length matters most."/>
+                        <TextBlock Grid.Row="4" Text="Scans folder" Style="{StaticResource FieldLabel}"/>
+                        <DockPanel Grid.Row="4" Grid.Column="1">
+                            <Button DockPanel.Dock="Right" Name="btnBrowse" Content="Browse" MinWidth="86" Margin="6,0,0,0"
+                                    Style="{StaticResource SecondaryButton}" AutomationProperties.Name="Browse for the scans folder"/>
+                            <TextBox Name="txtFolderPath" AutomationProperties.Name="Scans folder"/>
+                        </DockPanel>
+                        <TextBlock Grid.Row="5" Grid.Column="1" Style="{StaticResource Hint}" Margin="0,4,0,12"
+                                   Text="Folder on this PC where scans are saved."/>
+                        <TextBlock Grid.Row="6" Text="Share name" Style="{StaticResource FieldLabel}"/>
+                        <TextBox Grid.Row="6" Grid.Column="1" Name="txtShareName" AutomationProperties.Name="Share name"/>
+                        <TextBlock Grid.Row="7" Grid.Column="1" Name="txtSharePreview" Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+                    </Grid>
+                    <Border Name="pnlValidation" BorderBrush="$($script:thDanger)" BorderThickness="3,0,0,0" Background="$($script:thBgAlt)"
+                            Padding="10,8" Margin="0,14,0,0" Visibility="Collapsed">
+                        <StackPanel>
+                            <TextBlock Text="Check these before continuing" Foreground="$($script:thDanger)" FontWeight="SemiBold"/>
+                            <TextBlock Name="txtValidation" TextWrapping="Wrap" Foreground="$($script:thFgStrong)" Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </Border>
+                    <Expander Name="expAdvanced" Header="Advanced options" Margin="0,18,0,0">
+                        <Border BorderBrush="$($script:thBorder)" BorderThickness="1" CornerRadius="5" Padding="14,10" Margin="0,8,0,0">
+                            <StackPanel>
+                                <TextBlock Text="All steps are on by default. Turn off only what is already set up or managed elsewhere." Style="{StaticResource Hint}" Margin="0,0,0,10"/>
+                                <TextBlock Text="Account" Foreground="$($script:thFgStrong)" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                                <CheckBox Name="chkCreateUser" Content="Create or update the scan account" Margin="0,2"/>
+                                <CheckBox Name="chkHideUser" Content="Hide the scan account from the sign-in screen" Margin="0,2"
+                                          ToolTip="Skipped automatically on domain-joined PCs. Also sets the account password."/>
+                                <TextBlock Text="Folder and sharing" Foreground="$($script:thFgStrong)" FontWeight="SemiBold" Margin="0,10,0,4"/>
+                                <CheckBox Name="chkCreateFolder" Content="Create the scans folder" Margin="0,2"/>
+                                <CheckBox Name="chkSetPermissions" Content="Set least-privilege folder permissions (reviewed before applying)" Margin="20,2,0,2"/>
+                                <CheckBox Name="chkSetShare" Content="Share the folder over SMB" Margin="0,2"/>
+                                <CheckBox Name="chkCreateShortcut" Content="Add a desktop shortcut to the folder" Margin="0,2"/>
+                                <TextBlock Text="Network" Foreground="$($script:thFgStrong)" FontWeight="SemiBold" Margin="0,10,0,4"/>
+                                <CheckBox Name="chkNetworkSettings" Content="Check the network profile and File and Printer Sharing firewall rules" Margin="0,2"/>
+                                <CheckBox Name="chkNetworkDiscovery" Content="Also enable Network Discovery (optional)" Margin="20,2,0,2"
+                                          ToolTip="Only needed when the printer browses the network to find this PC. Typed paths such as \\PC\scans work without it."/>
+                            </StackPanel>
+                        </Border>
+                    </Expander>
+                </StackPanel>
+
+                <StackPanel Name="pageReview" Visibility="Collapsed">
+                    <TextBlock Text="Review changes" Style="{StaticResource PageTitle}"/>
+                    <TextBlock Style="{StaticResource Hint}" FontSize="13" Margin="0,4,0,16"
+                               Text="Scans will make these changes on this PC. Back keeps your choices."/>
+                    <Border BorderBrush="$($script:thBorder)" BorderThickness="1" CornerRadius="5" Padding="14,6">
+                        <Grid Name="grdReview">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" MinWidth="140"/>
+                                <ColumnDefinition/>
+                            </Grid.ColumnDefinitions>
+                        </Grid>
+                    </Border>
+                    <Border Name="pnlAccountNotice" BorderThickness="3,0,0,0" Background="$($script:thBgAlt)" Padding="12,10" Margin="0,14,0,0" Visibility="Collapsed">
+                        <StackPanel>
+                            <TextBlock Name="txtAccountNotice" TextWrapping="Wrap" FontWeight="SemiBold"/>
+                            <CheckBox Name="chkConfirmExisting" Content="Yes, change the password for this existing account" Margin="0,8,0,0"
+                                      Foreground="$($script:thFgStrong)" Visibility="Collapsed"/>
+                        </StackPanel>
+                    </Border>
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,14,0,0"
+                               Text="Folder permissions and existing shares open for review while applying. Nothing is removed unless you select it."/>
+                </StackPanel>
+
+                <StackPanel Name="pageApply" Visibility="Collapsed">
+                    <TextBlock Text="Applying changes" Style="{StaticResource PageTitle}"/>
+                    <TextBlock Name="txtStatus" Text="Starting..." Foreground="$($script:thFgStrong)" TextWrapping="Wrap" Margin="0,10,0,8"/>
+                    <ProgressBar Name="progressBar" Height="8" Minimum="0" Maximum="1" Value="0"/>
+                    <Border Name="pnlPasswordRetry" BorderBrush="$($script:thWarn)" BorderThickness="3,0,0,0" Background="$($script:thBgAlt)"
+                            Padding="14,12" Margin="0,16,0,0" Visibility="Collapsed">
+                        <StackPanel>
+                            <TextBlock Text="Windows rejected the scan account password. Setup is paused." Foreground="$($script:thWarn)" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                            <TextBlock Name="txtRetryError" TextWrapping="Wrap" Foreground="$($script:thFgStrong)" Margin="0,6,0,0"/>
+                            <TextBlock Name="txtRetryRemediation" Style="{StaticResource Hint}" Margin="0,6,0,12"/>
+                            <TextBlock Text="New password" Foreground="$($script:thFgStrong)" Margin="0,0,0,4"/>
+                            $(Get-ScanPasswordFieldXaml -Prefix 'retry' -Label 'New password')
+                            <DockPanel Margin="0,12,0,0" LastChildFill="False">
+                                <TextBlock Style="{StaticResource Hint}" VerticalAlignment="Center" MaxWidth="330"
+                                           Text="Retry resumes account setup, then the remaining steps."/>
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Name="btnRetryCancel" Content="Cancel setup" Style="{StaticResource SecondaryButton}" MinWidth="105" Height="30"/>
+                                    <Button Name="btnRetryPassword" Content="Retry" MinWidth="90" Height="30" FontWeight="SemiBold" Margin="8,0,0,0" IsEnabled="False"/>
+                                </StackPanel>
+                            </DockPanel>
+                        </StackPanel>
+                    </Border>
+                    <TextBlock Text="Activity" Style="{StaticResource SectionTitle}"/>
+                    <ListBox Name="lstDetails" Height="230" AutomationProperties.Name="Setup activity"/>
+                </StackPanel>
+
+                <StackPanel Name="pageDone" Visibility="Collapsed">
+                    <Border Name="bdrOutcome" BorderThickness="4,0,0,0" Background="$($script:thBgAlt)" Padding="14,10">
+                        <StackPanel>
+                            <TextBlock Name="txtOutcomeTitle" FontSize="19" FontWeight="SemiBold"/>
+                            <TextBlock Name="txtOutcomeMessage" TextWrapping="Wrap" Foreground="$($script:thFgStrong)" Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </Border>
+                    <StackPanel Name="pnlConnection">
+                        <TextBlock Text="Printer connection details" Style="{StaticResource SectionTitle}"/>
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,8"
+                                   Text="Use the host name where you can. The IP address is an alternative, but DHCP can change it; reserve the address on the router if the printer needs it."/>
+                        <Border BorderBrush="$($script:thBorder)" BorderThickness="1" CornerRadius="5" Padding="14,4">
+                            <Grid Name="grdConnection">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" MinWidth="150"/>
+                                    <ColumnDefinition/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                            </Grid>
+                        </Border>
+                        <TextBlock Name="txtCopyStatus" Foreground="$($script:thSuccess)" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                    <StackPanel Name="pnlResultsSection">
+                        <TextBlock Text="What happened" Style="{StaticResource SectionTitle}"/>
+                        <StackPanel Name="pnlResults"/>
+                        <Button Name="btnCopySummary" Content="Copy summary" Style="{StaticResource SecondaryButton}" HorizontalAlignment="Left"
+                                MinWidth="120" Height="30" Margin="0,12,0,0" ToolTip="Copy the outcome, connection details, and step results. The password is not included."/>
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+        </ScrollViewer>
+
+        <Border Grid.Row="2" BorderBrush="$($script:thBorder)" BorderThickness="0,1,0,0" Padding="22,12">
+            <DockPanel LastChildFill="False">
+                <TextBlock Name="txtProvider" Text="Provided by PrintMaster" FontSize="11" VerticalAlignment="Center"/>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Name="btnCancel" Content="Cancel" Style="{StaticResource SecondaryButton}" MinWidth="85" Height="32" IsCancel="True" Margin="8,0,0,0"/>
+                    <Button Name="btnBack" Content="Back" Style="{StaticResource SecondaryButton}" MinWidth="85" Height="32" Margin="8,0,0,0"/>
+                    <Button Name="btnNext" Content="Next" MinWidth="110" Height="32" FontWeight="SemiBold" IsDefault="True" Margin="8,0,0,0"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>
+"@
+	$window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($wizardXaml))
+	$window.Icon = New-PrintMasterIcon
+	$window.FindName('imgLogo').Source = $window.Icon
+	Set-WindowTheme $window
+	return $window
+}
+
+function Set-ScanWizardConfiguration {
+	param($Window, $Configuration)
+	$c = $Configuration
+	$Window.FindName('txtUsername').Text = $c.Username
+	$Window.FindName('txtFolderPath').Text = $c.FolderPath
+	$Window.FindName('txtShareName').Text = $c.ShareName
+	$Window.FindName('chkCreateUser').IsChecked = $c.CreateUser
+	$Window.FindName('chkHideUser').IsChecked = $c.HideUser
+	$Window.FindName('chkCreateFolder').IsChecked = $c.CreateFolder
+	$Window.FindName('chkSetPermissions').IsChecked = $c.SetPermissions
+	$Window.FindName('chkSetShare').IsChecked = $c.SetShare
+	$Window.FindName('chkCreateShortcut').IsChecked = $c.CreateShortcut
+	$Window.FindName('chkNetworkSettings').IsChecked = $c.CheckNetwork
+	$Window.FindName('chkNetworkDiscovery').IsChecked = $c.EnableDiscovery
+	Update-ScanOptionDependencies -Window $Window
+	Update-ScanSharePreview -Window $Window
+}
+
+function Get-ScanWizardConfiguration {
+	param($Window)
+	$checkNetwork = [bool]$Window.FindName('chkNetworkSettings').IsChecked
+	$createFolder = [bool]$Window.FindName('chkCreateFolder').IsChecked
+	return [pscustomobject]@{
+		Username        = $Window.FindName('txtUsername').Text.Trim()
+		FolderPath      = $Window.FindName('txtFolderPath').Text.Trim()
+		ShareName       = $Window.FindName('txtShareName').Text.Trim()
+		Description     = $script:description
+		CreateUser      = [bool]$Window.FindName('chkCreateUser').IsChecked
+		HideUser        = [bool]$Window.FindName('chkHideUser').IsChecked
+		CreateFolder    = $createFolder
+		# Permissions are applied by the folder step; Discovery by the network step.
+		SetPermissions  = $createFolder -and [bool]$Window.FindName('chkSetPermissions').IsChecked
+		SetShare        = [bool]$Window.FindName('chkSetShare').IsChecked
+		CreateShortcut  = [bool]$Window.FindName('chkCreateShortcut').IsChecked
+		CheckNetwork    = $checkNetwork
+		EnableDiscovery = $checkNetwork -and [bool]$Window.FindName('chkNetworkDiscovery').IsChecked
+	}
+}
+
+function Update-ScanOptionDependencies {
+	param($Window)
+	$Window.FindName('chkSetPermissions').IsEnabled = [bool]$Window.FindName('chkCreateFolder').IsChecked
+	$Window.FindName('chkNetworkDiscovery').IsEnabled = [bool]$Window.FindName('chkNetworkSettings').IsChecked
+}
+
+function Update-ScanSharePreview {
+	param($Window)
+	$share = $Window.FindName('txtShareName').Text.Trim()
+	$Window.FindName('txtSharePreview').Text = if ($share) { "Printers will use \\$env:COMPUTERNAME\$share" } else { 'Name printers use to reach the folder over the network.' }
+}
+
+function Set-ScanWizardPage {
+	<#
+	.SYNOPSIS
+		Shows one page and sets the step indicator and footer buttons to match.
+	#>
+	param($Window, [ValidateSet('Configure', 'Review', 'Apply', 'Done')][string]$Page)
+	$pages = @('Configure', 'Review', 'Apply', 'Done')
+	$current = [array]::IndexOf($pages, $Page)
+	for ($i = 0; $i -lt $pages.Count; $i++) {
+		$name = $pages[$i]
+		$Window.FindName("page$name").Visibility = if ($i -eq $current) { 'Visible' } else { 'Collapsed' }
+		$tab = $Window.FindName("step$name")
+		$label = $Window.FindName("txtStep$name")
+		$tab.BorderBrush = ConvertTo-ScanBrush $(if ($i -eq $current) { $script:thAccent } elseif ($i -lt $current) { $script:thAccentHi } else { 'Transparent' })
+		$label.Foreground = ConvertTo-ScanBrush $(if ($i -le $current) { $script:thFgStrong } else { $script:thFg })
+		$label.FontWeight = if ($i -eq $current) { [System.Windows.FontWeights]::SemiBold } else { [System.Windows.FontWeights]::Normal }
+	}
+	$back = $Window.FindName('btnBack')
+	$cancel = $Window.FindName('btnCancel')
+	$next = $Window.FindName('btnNext')
+	switch ($Page) {
+		'Configure' { $back.Visibility = 'Collapsed'; $cancel.Visibility = 'Visible'; $cancel.IsEnabled = $true; $next.Content = 'Next'; $next.IsEnabled = $true }
+		'Review' { $back.Visibility = 'Visible'; $back.Content = 'Back'; $cancel.Visibility = 'Visible'; $cancel.IsEnabled = $true; $next.Content = 'Apply' }
+		'Apply' { $back.Visibility = 'Collapsed'; $cancel.Visibility = 'Visible'; $cancel.IsEnabled = $false; $next.Content = 'Apply'; $next.IsEnabled = $false }
+		'Done' { $back.Visibility = 'Visible'; $back.Content = 'Back to setup'; $cancel.Visibility = 'Collapsed'; $next.Content = 'Close'; $next.IsEnabled = $true }
+	}
+	$Window.Tag = $Page
+	$Window.FindName('scrollPages').ScrollToTop()
+	Write-Verbose "Wizard page: $Page"
+}
+
+function Set-ScanDetailRows {
+	<#
+	.SYNOPSIS
+		Renders label/value rows (Review page, Done page) into a 2-3 column Grid.
+		With -WithCopy, each copyable row gets a Copy button keyed by Row.Key.
+	#>
+	param($Window, $Grid, [object[]]$Rows, [switch]$WithCopy)
+	$Grid.Children.Clear()
+	$Grid.RowDefinitions.Clear()
+	$secondary = $Window.FindResource('SecondaryButton')
+	for ($i = 0; $i -lt $Rows.Count; $i++) {
+		$row = $Rows[$i]
+		$Grid.RowDefinitions.Add([System.Windows.Controls.RowDefinition]::new())
+		$label = [System.Windows.Controls.TextBlock]::new()
+		$label.Text = $row.Label
+		$label.Margin = '0,7,14,7'
+		$label.TextWrapping = 'Wrap'
+		[System.Windows.Controls.Grid]::SetRow($label, $i)
+		[void]$Grid.Children.Add($label)
+
+		$valuePanel = [System.Windows.Controls.StackPanel]::new()
+		$valuePanel.Margin = '0,7,0,7'
+		$valuePanel.VerticalAlignment = 'Center'
+		$value = [System.Windows.Controls.TextBlock]::new()
+		$value.TextWrapping = 'Wrap'
+		$value.Text = if ($row.Sensitive) { [string]::new([char]0x25CF, 12) } else { $row.Value }
+		$tone = if ($row.Tone) { $row.Tone } elseif ($WithCopy -and -not $row.CanCopy) { 'Muted' } else { 'Normal' }
+		$value.Foreground = ConvertTo-ScanBrush (Get-ScanToneColor $tone)
+		if ($tone -eq 'Normal' -or $tone -eq 'Warn') { $value.FontWeight = [System.Windows.FontWeights]::SemiBold }
+		[void]$valuePanel.Children.Add($value)
+		if ($row.Hint) {
+			$hint = [System.Windows.Controls.TextBlock]::new()
+			$hint.Text = $row.Hint
+			$hint.FontSize = 11.5
+			$hint.TextWrapping = 'Wrap'
+			[void]$valuePanel.Children.Add($hint)
+		}
+		[System.Windows.Controls.Grid]::SetRow($valuePanel, $i)
+		[System.Windows.Controls.Grid]::SetColumn($valuePanel, 1)
+		[void]$Grid.Children.Add($valuePanel)
+
+		if ($WithCopy -and $row.CanCopy) {
+			$actions = [System.Windows.Controls.StackPanel]::new()
+			$actions.Orientation = 'Horizontal'
+			$actions.VerticalAlignment = 'Center'
+			$actions.HorizontalAlignment = 'Right'
+			$actions.Margin = '10,0,0,0'
+			if ($row.Sensitive) {
+				$reveal = [System.Windows.Controls.Button]::new()
+				$reveal.Content = 'Show'
+				$reveal.Style = $secondary
+				$reveal.MinWidth = 58
+				$reveal.Height = 28
+				$reveal.Margin = '0,0,6,0'
+				$reveal.Tag = $value
+				[System.Windows.Automation.AutomationProperties]::SetName($reveal, "Show $($row.Label)")
+				$reveal.Add_Click({ Switch-ScanDonePasswordReveal -Button $this })
+				[void]$actions.Children.Add($reveal)
+			}
+			$copy = [System.Windows.Controls.Button]::new()
+			$copy.Content = 'Copy'
+			$copy.Style = $secondary
+			$copy.MinWidth = 58
+			$copy.Height = 28
+			$copy.Tag = $row.Key
+			[System.Windows.Automation.AutomationProperties]::SetName($copy, "Copy $($row.Label)")
+			$copy.Add_Click({ Copy-ScanConnectionDetail -Window ([System.Windows.Window]::GetWindow($this)) -Key $this.Tag })
+			[void]$actions.Children.Add($copy)
+			[System.Windows.Controls.Grid]::SetRow($actions, $i)
+			[System.Windows.Controls.Grid]::SetColumn($actions, 2)
+			[void]$Grid.Children.Add($actions)
+		}
+	}
+}
+
+function Switch-ScanDonePasswordReveal {
+	# Deliberate reveal of the password set in this run; Hide restores the mask.
+	param($Button)
+	$valueBlock = $Button.Tag
+	if ($Button.Content -eq 'Show' -and (Test-ScanSecretPresent -Secret $script:wizardResult.Password)) {
+		Use-ScanPlainText -Secret $script:wizardResult.Password -ScriptBlock {
+			param($plainSecret)
+			$valueBlock.Text = $plainSecret
+		}
+		$valueBlock.FontFamily = [System.Windows.Media.FontFamily]::new('Consolas')
+		$Button.Content = 'Hide'
+		Write-Verbose 'Scan password shown on the Done page at the user''s request.'
+	}
+	else {
+		$valueBlock.Text = [string]::new([char]0x25CF, 12)
+		$valueBlock.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe UI')
+		$Button.Content = 'Show'
+	}
+}
+
+function Copy-ScanConnectionDetail {
+	param($Window, [string]$Key)
+	$row = @($script:connectionDetails | Where-Object { $_.Key -eq $Key }) | Select-Object -First 1
+	if (-not $row -or -not $row.CanCopy) { return }
+	$status = $Window.FindName('txtCopyStatus')
+	try {
+		if ($row.Sensitive) {
+			Copy-ScanSecret -Secret $script:wizardResult.Password
+			$status.Text = 'Copied the password. If it is still on the clipboard when Scans closes, Scans clears it.'
+		}
+		else {
+			Set-ScanClipboardText -Text $row.Value
+			$status.Text = "Copied $($row.Label): $($row.Value)"
+		}
+		Write-Verbose "Copied connection detail '$Key' to the clipboard."
+	}
+	catch {
+		$status.Text = "Could not copy $($row.Label): $($_.Exception.Message)"
+		Write-Warning "Copying connection detail '$Key' failed: $($_.Exception.Message)"
+	}
+}
+
+function New-ScanStepResultElement {
+	# One line in the Done page result list: status glyph, message, error, and fix.
+	param($Step)
+	$glyph, $tone = switch ($Step.Status) {
+		'Success' { [string][char]0x2714, 'Success' }
+		'Failed' { [string][char]0x2716, 'Danger' }
+		'Warning' { [string][char]0x26A0, 'Warn' }
+		default { [string][char]0x2013, 'Muted' }
+	}
+	$row = [System.Windows.Controls.DockPanel]::new()
+	$row.Margin = '0,3,0,3'
+	$icon = [System.Windows.Controls.TextBlock]::new()
+	$icon.Text = $glyph
+	$icon.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe UI Symbol')
+	$icon.Width = 22
+	$icon.Foreground = ConvertTo-ScanBrush (Get-ScanToneColor $tone)
+	[System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
+	[void]$row.Children.Add($icon)
+	$text = [System.Windows.Controls.StackPanel]::new()
+	$message = [System.Windows.Controls.TextBlock]::new()
+	$message.Text = $Step.Message
+	$message.TextWrapping = 'Wrap'
+	$message.Foreground = ConvertTo-ScanBrush (Get-ScanToneColor $(if ($Step.Status -eq 'Skipped') { 'Muted' } else { 'Normal' }))
+	[void]$text.Children.Add($message)
+	if ($Step.Error) {
+		$errorText = [System.Windows.Controls.TextBlock]::new()
+		$errorText.Text = $Step.Error
+		$errorText.TextWrapping = 'Wrap'
+		$errorText.Foreground = ConvertTo-ScanBrush $script:thDanger
+		$errorText.Margin = '0,2,0,0'
+		[void]$text.Children.Add($errorText)
+	}
+	if ($Step.Tip) {
+		$tip = [System.Windows.Controls.TextBlock]::new()
+		$tip.Text = "How to fix: $($Step.Tip)"
+		$tip.TextWrapping = 'Wrap'
+		$tip.FontSize = 12
+		$tip.Margin = '0,2,0,0'
+		[void]$text.Children.Add($tip)
+	}
+	[void]$row.Children.Add($text)
+	return $row
+}
+
+function Update-ScanDonePage {
+	param($Window, $Result, $Configuration)
+	$outcome = Get-ScanSetupOutcome -Result $Result
+	$tone = switch ($outcome.State) { 'Ready' { 'Success' } 'NotReady' { 'Danger' } default { 'Warn' } }
+	$color = ConvertTo-ScanBrush (Get-ScanToneColor $tone)
+	$Window.FindName('bdrOutcome').BorderBrush = $color
+	$Window.FindName('txtOutcomeTitle').Foreground = $color
+	$Window.FindName('txtOutcomeTitle').Text = $outcome.Title
+	$Window.FindName('txtOutcomeMessage').Text = $outcome.Message
+
+	$script:connectionDetails = @()
+	if (-not $Result.Canceled) {
+		$script:connectionDetails = @(Get-ScanConnectionDetails -Identity $Result.Identity -Username $Configuration.Username `
+			-ShareName $Result.ShareName -ShareConfigured $Result.ShareConfigured -FolderPath $Configuration.FolderPath `
+			-Addresses @(Get-ScanNetworkAddresses) -PasswordAvailable ([bool]$Result.Password))
+	}
+	$Window.FindName('pnlConnection').Visibility = if ($script:connectionDetails.Count) { 'Visible' } else { 'Collapsed' }
+	Set-ScanDetailRows -Window $Window -Grid $Window.FindName('grdConnection') -Rows $script:connectionDetails -WithCopy
+	$Window.FindName('txtCopyStatus').Text = ''
+
+	$results = $Window.FindName('pnlResults')
+	$results.Children.Clear()
+	foreach ($step in $Result.Steps) { [void]$results.Children.Add((New-ScanStepResultElement -Step $step)) }
+	# Lead with what went wrong when the PC is not ready; otherwise lead with the details.
+	$page = $Window.FindName('pageDone')
+	$section = $Window.FindName('pnlResultsSection')
+	$page.Children.Remove($section)
+	if ($outcome.State -eq 'NotReady' -or $outcome.State -eq 'Canceled') { $page.Children.Insert(1, $section) }
+	else { [void]$page.Children.Add($section) }
+	$script:wizardOutcome = $outcome
+	$Window.Title = "PrintMaster Scans Setup - $($outcome.Title)"
+	Write-Verbose "Setup outcome: $($outcome.State). $($outcome.Message)"
+}
+
+function Update-ScanReviewGate {
+	param($Window)
+	$gate = Get-ScanReviewGate -Configuration $script:wizardConfiguration -AccountState $script:wizardAccountState `
+		-Confirmed ([bool]$Window.FindName('chkConfirmExisting').IsChecked)
+	$notice = $Window.FindName('pnlAccountNotice')
+	if ($gate.Notice) {
+		$color = ConvertTo-ScanBrush (Get-ScanToneColor $gate.Tone)
+		$notice.BorderBrush = $color
+		$Window.FindName('txtAccountNotice').Foreground = $color
+		$Window.FindName('txtAccountNotice').Text = $gate.Notice
+		$notice.Visibility = 'Visible'
+	}
+	else {
+		$notice.Visibility = 'Collapsed'
+	}
+	$Window.FindName('chkConfirmExisting').Visibility = if ($gate.NeedsConfirmation) { 'Visible' } else { 'Collapsed' }
+	$Window.FindName('btnNext').IsEnabled = $gate.CanApply
+	return $gate
+}
+
+function Show-ScanWizardReview {
+	# Configure -> Review: validate, run the read-only account pre-check, render.
+	param($Window)
+	$configuration = Get-ScanWizardConfiguration -Window $Window
+	$problems = @(Test-ScanWizardConfiguration -Configuration $configuration -PasswordPresent (Test-ScanPasswordFieldHasValue -Window $Window -Prefix 'config'))
+	$validation = $Window.FindName('pnlValidation')
+	if ($problems.Count) {
+		$Window.FindName('txtValidation').Text = ($problems | ForEach-Object { "- $_" }) -join "`n"
+		$validation.Visibility = 'Visible'
+		Write-Verbose "Configure page has $($problems.Count) problem(s); staying on Configure."
+		return $false
+	}
+	$validation.Visibility = 'Collapsed'
+	$script:wizardConfiguration = $configuration
+	$script:wizardAccountState = $null
+	if (Test-ScanAccountStepSelected -Configuration $configuration) {
+		$script:wizardAccountState = Get-ScanAccountState -Username $configuration.Username
+	}
+	Set-ScanDetailRows -Window $Window -Grid $Window.FindName('grdReview') -Rows @(Get-ScanSetupReview -Configuration $configuration -AccountState $script:wizardAccountState)
+	$Window.FindName('chkConfirmExisting').IsChecked = $false
+	Set-ScanWizardPage -Window $Window -Page 'Review'
+	Update-ScanReviewGate -Window $Window | Out-Null
+	return $true
+}
+
+function Start-ScanWizardApply {
+	# Review -> Apply -> Done. The window cannot close while this runs.
+	param($Window)
+	$gate = Update-ScanReviewGate -Window $Window
+	if (-not $gate.CanApply) { return }
+	$configuration = $script:wizardConfiguration
+	$script:confirmedExistingAccount = if ($gate.NeedsConfirmation) { $configuration.Username } else { $null }
+	Clear-ScanWizardResult
+	Set-ScanWizardPage -Window $Window -Page 'Apply'
+	$script:wizardBusy = $true
+	$password = Get-ScanPasswordFieldSecret -Window $Window -Prefix 'config'
+	try {
+		$result = Invoke-ScanSetup -Configuration $configuration -Password $password
+	}
+	catch {
+		# Unexpected failures still land on the Done page instead of crashing the window.
+		Write-Warning "Setup stopped unexpectedly: $($_.Exception.Message)"
+		Show-StepResult @{ Status = 'Failed'; Message = 'Setup stopped unexpectedly'; Error = $_.Exception.Message } -Category 'General'
+		$result = New-ScanSetupResult -Configuration $configuration
+		$result.Identity = Get-ScanComputerIdentity
+		$result.Steps = @($script:stepResults)
+	}
+	finally {
+		$script:wizardBusy = $false
+		$script:confirmedExistingAccount = $null
+	}
+	if ($result.Password -and -not [object]::ReferenceEquals($result.Password, $password)) {
+		# Keep an accepted replacement so Back to setup reruns with it.
+		Set-ScanPasswordFieldSecret -Window $Window -Prefix 'config' -Secret $result.Password
+	}
+	if (-not [object]::ReferenceEquals($result.Password, $password)) { $password.Dispose() }
+	if ($result.ShareName -and $result.ShareName -ne $configuration.ShareName) {
+		$Window.FindName('txtShareName').Text = $result.ShareName
+	}
+	$script:wizardResult = $result
+	Update-ScanDonePage -Window $Window -Result $result -Configuration $configuration
+	Set-ScanWizardPage -Window $Window -Page 'Done'
+}
+
+function Clear-ScanWizardResult {
+	if ($script:wizardResult -and $script:wizardResult.Password) { $script:wizardResult.Password.Dispose() }
+	$script:wizardResult = $null
+	$script:connectionDetails = @()
+}
+
+function Invoke-ScanWizardNext {
+	param($Window)
+	switch ($Window.Tag) {
+		'Configure' { Show-ScanWizardReview -Window $Window | Out-Null }
+		'Review' { Start-ScanWizardApply -Window $Window }
+		'Done' { $Window.Close() }
+	}
+}
+
+function Invoke-ScanWizardBack {
+	# Back never discards Configure page input; Done -> Configure starts a new run.
+	param($Window)
+	switch ($Window.Tag) {
+		'Review' { Set-ScanWizardPage -Window $Window -Page 'Configure' }
+		'Done' {
+			Clear-ScanWizardResult
+			$Window.Title = 'PrintMaster Scans Setup'
+			Set-ScanWizardPage -Window $Window -Page 'Configure'
+		}
+	}
+}
+
+function Wait-ScanWizardPrompt {
+	# Runs a nested message loop until Complete-ScanWizardPrompt is called, so
+	# inline prompts can pause setup without a modal window.
+	$script:wizardPromptResult = $false
+	$script:wizardPromptFrame = [System.Windows.Threading.DispatcherFrame]::new()
+	try { [System.Windows.Threading.Dispatcher]::PushFrame($script:wizardPromptFrame) }
+	finally { $script:wizardPromptFrame = $null }
+	return $script:wizardPromptResult
+}
+
+function Complete-ScanWizardPrompt {
+	param([bool]$Accepted)
+	$script:wizardPromptResult = $Accepted
+	if ($script:wizardPromptFrame) { $script:wizardPromptFrame.Continue = $false }
+}
+
+function Request-ScanReplacementPassword {
+	<#
+	.SYNOPSIS
+		Shows the inline retry panel on the Apply page and waits. Returns the new
+		password as a SecureString, or $null when the user cancels setup.
+	#>
+	param([string]$ErrorText, $Window = $script:progressWindow)
+	$panel = $Window.FindName('pnlPasswordRetry')
+	$Window.FindName('txtRetryError').Text = $ErrorText
+	$Window.FindName('txtRetryRemediation').Text = $script:Remediation.PasswordPolicy
+	Clear-ScanPasswordField -Window $Window -Prefix 'retry'
+	$Window.FindName('btnRetryPassword').IsEnabled = $false
+	$Window.FindName('txtStatus').Text = 'Paused: waiting for a new scan account password.'
+	$panel.Visibility = 'Visible'
+	$panel.BringIntoView()
+	$Window.FindName('retryPasswordBox').Focus() | Out-Null
+	Write-Verbose 'Account setup paused for a replacement password.'
+	try {
+		if (Wait-ScanWizardPrompt) {
+			Write-Verbose 'Replacement password entered; retrying account setup.'
+			return Get-ScanPasswordFieldSecret -Window $Window -Prefix 'retry'
+		}
+		Write-Verbose 'Password correction canceled.'
+		return $null
+	}
+	finally {
+		Clear-ScanPasswordField -Window $Window -Prefix 'retry'
+		$panel.Visibility = 'Collapsed'
+	}
+}
+
+function Initialize-ScanWizard {
+	<#
+	.SYNOPSIS
+		Fills the wizard from a configuration and wires every handler. Handlers
+		resolve the window from the sender, so no closures are captured.
+	#>
+	param($Window, $Configuration)
+	$script:wizardBusy = $false
+	$script:wizardResult = $null
+	$script:connectionDetails = @()
+	Register-ScanPasswordField -Window $Window -Prefix 'config'
+	Register-ScanPasswordField -Window $Window -Prefix 'retry'
+	Set-ScanWizardConfiguration -Window $Window -Configuration $Configuration
+	Set-ScanPasswordFieldText -Window $Window -Prefix 'config' -Text (New-ScanPassphrase)
+
+	foreach ($name in @('chkCreateFolder', 'chkNetworkSettings')) {
+		$Window.FindName($name).Add_Checked({ Update-ScanOptionDependencies -Window ([System.Windows.Window]::GetWindow($this)) })
+		$Window.FindName($name).Add_Unchecked({ Update-ScanOptionDependencies -Window ([System.Windows.Window]::GetWindow($this)) })
+	}
+	$Window.FindName('txtShareName').Add_TextChanged({ Update-ScanSharePreview -Window ([System.Windows.Window]::GetWindow($this)) })
+	$Window.FindName('btnBrowse').Add_Click({
+		$owner = [System.Windows.Window]::GetWindow($this)
+		$folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+		$folderBrowser.Description = 'Select folder for scans'
+		$folderBrowser.SelectedPath = $owner.FindName('txtFolderPath').Text
+		$folderBrowser.ShowNewFolderButton = $true
+		if ($folderBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+			$owner.FindName('txtFolderPath').Text = $folderBrowser.SelectedPath
+		}
+	})
+	$Window.FindName('chkConfirmExisting').Add_Checked({ Update-ScanReviewGate -Window ([System.Windows.Window]::GetWindow($this)) | Out-Null })
+	$Window.FindName('chkConfirmExisting').Add_Unchecked({ Update-ScanReviewGate -Window ([System.Windows.Window]::GetWindow($this)) | Out-Null })
+	$Window.FindName('retryPasswordBox').Add_PasswordChanged({
+		$owner = [System.Windows.Window]::GetWindow($this)
+		$owner.FindName('btnRetryPassword').IsEnabled = Test-ScanPasswordFieldHasValue -Window $owner -Prefix 'retry'
+	})
+	$Window.FindName('btnRetryPassword').Add_Click({ Complete-ScanWizardPrompt -Accepted $true })
+	$Window.FindName('btnRetryCancel').Add_Click({ Complete-ScanWizardPrompt -Accepted $false })
+	$Window.FindName('btnNext').Add_Click({ Invoke-ScanWizardNext -Window ([System.Windows.Window]::GetWindow($this)) })
+	$Window.FindName('btnBack').Add_Click({ Invoke-ScanWizardBack -Window ([System.Windows.Window]::GetWindow($this)) })
+	$Window.FindName('btnCancel').Add_Click({
+		if (-not $script:wizardBusy) { [System.Windows.Window]::GetWindow($this).Close() }
+	})
+	$Window.FindName('btnCopySummary').Add_Click({
+		$owner = [System.Windows.Window]::GetWindow($this)
+		$summary = Get-ScanSetupSummaryText -Outcome $script:wizardOutcome -Details $script:connectionDetails -Steps $script:wizardResult.Steps
+		try {
+			Set-ScanClipboardText -Text $summary
+			$owner.FindName('txtCopyStatus').Text = 'Copied the setup summary. The password is not included.'
+			Write-Verbose 'Copied the setup summary to the clipboard.'
+		}
+		catch {
+			$owner.FindName('txtCopyStatus').Text = "Could not copy the summary: $($_.Exception.Message)"
+		}
+	})
+	$Window.Add_Closing({
+		if ($script:wizardBusy) {
+			$_.Cancel = $true
+			Write-Verbose 'Ignored a close request while setup is running.'
+		}
+	})
+	$Window.Add_Closed({
+		Clear-ScanCopiedSecret
+		Clear-ScanWizardResult
+		Clear-ScanPasswordField -Window $this -Prefix 'config'
+		Clear-ScanPasswordField -Window $this -Prefix 'retry'
+		Write-Verbose 'Setup wizard closed; secrets cleared.'
+	})
+	Set-ScanWizardPage -Window $Window -Page 'Configure'
+	$Window.Add_ContentRendered({ $this.FindName('txtUsername').Focus() | Out-Null })
+}
+
+$wizard = New-ScanWizardWindow
+# Existing folder/share review dialogs and the account fallback prompt use this owner.
+$script:progressWindow = $wizard
+Initialize-ScanWizard -Window $wizard -Configuration (New-ScanSetupConfiguration)
+Write-Verbose 'Showing the setup wizard.'
+$wizard.ShowDialog() | Out-Null
 if ($Elevated) { Exit 0 }
