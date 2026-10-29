@@ -440,49 +440,253 @@ function Initialize-ScanUser {
 	return $results
 }
 
+function Resolve-ScanAccountSid {
+	param([string]$AccountName)
+
+	if ([string]::IsNullOrWhiteSpace($AccountName)) {
+		throw 'Choose the receiving Windows user before applying folder permissions.'
+	}
+	return [System.Security.Principal.NTAccount]::new($AccountName).Translate([System.Security.Principal.SecurityIdentifier])
+}
+
+function Get-ScanDesktopUser {
+	# ComputerSystem.UserName reports the console user, which can be someone else
+	# in an RDP session. Query the session hosting this UI, not the elevated token.
+	if (-not ('PrintMaster.ScansDesktopSession' -as [type])) {
+		Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace PrintMaster {
+    public static class ScansDesktopSession {
+        [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool WTSQuerySessionInformation(
+            IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+        [DllImport("wtsapi32.dll")]
+        private static extern void WTSFreeMemory(IntPtr buffer);
+        private static string Read(int sessionId, int infoClass) {
+            IntPtr buffer;
+            int bytes;
+            if (!WTSQuerySessionInformation(IntPtr.Zero, sessionId, infoClass, out buffer, out bytes))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            try { return Marshal.PtrToStringUni(buffer); }
+            finally { WTSFreeMemory(buffer); }
+        }
+        public static string UserName(int sessionId) {
+            string user = Read(sessionId, 5);
+            if (String.IsNullOrWhiteSpace(user)) return null;
+            string domain = Read(sessionId, 7);
+            return String.IsNullOrWhiteSpace(domain) ? user : domain + "\\" + user;
+        }
+    }
+}
+'@ -ErrorAction Stop
+	}
+	return [PrintMaster.ScansDesktopSession]::UserName((Get-Process -Id $PID -ErrorAction Stop).SessionId)
+}
+
+function Get-ScanFolderCleanupRules {
+	param(
+		$Acl,
+		[System.Security.Principal.SecurityIdentifier]$ScanSid
+	)
+
+	# Old versions did not mark their ACEs. Matching this shape is only a review
+	# candidate, never proof that Scans owns the rule or permission to remove it.
+	foreach ($rule in $Acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+		if ($rule.AccessControlType -ne 'Allow' -or
+			$rule.InheritanceFlags -ne 'ContainerInherit,ObjectInherit' -or
+			$rule.PropagationFlags -ne 'None') { continue }
+
+		$sid = $rule.IdentityReference.Value
+		$isBroad = $sid -eq 'S-1-1-0' -or $sid -match '^S-1-5-21-\d+-\d+-\d+-513$'
+		$legacyModify = [System.Security.AccessControl.FileSystemRights]::Modify -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
+		if (($isBroad -and $rule.FileSystemRights -eq $legacyModify) -or
+			($sid -eq $ScanSid.Value -and $rule.FileSystemRights -eq [System.Security.AccessControl.FileSystemRights]::FullControl)) {
+			$rule
+		}
+	}
+}
+
+function Show-ScanFolderAccessDialog {
+	param(
+		[string]$FolderPath,
+		[string]$DesktopUser,
+		[string]$ElevatedUser,
+		$Acl,
+		[array]$CleanupRules
+	)
+
+	[xml]$folderAccessXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="PrintMaster Scans - Folder Access" Width="640" SizeToContent="Height" MaxHeight="780"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResize" ShowInTaskbar="False"
+        Background="$($script:thBg)" Foreground="$($script:thFg)" FontFamily="Segoe UI" FontSize="13">
+$($script:themeResources)
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="12">
+            <TextBlock Name="txtFolder" TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Text="Scan account: list/read data, create/write files, create folders/append data. No explicit delete, execute, permission-change, or ownership grant. Windows also adds Synchronize." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Name="txtIdentity" TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Text="Receiving Windows user (PC\user or DOMAIN\user):" Margin="0,0,0,4"/>
+            <TextBox Name="txtRecipient" Margin="0,0,0,8"/>
+            <TextBlock Text="This user, local Administrators, and SYSTEM receive Full Control. The receiving user must differ from the scan account." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <CheckBox Name="chkEveryone" Content="Also grant Everyone Modify (not recommended)" Margin="0,0,0,4"/>
+            <TextBlock Text="Optional broader access lets other users read, change, and delete scans at the NTFS layer. SMB share access is separate." TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBlock Name="txtPolicy" TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <TextBox Name="txtExistingRules" IsReadOnly="True" TextWrapping="Wrap" Height="140"
+                     VerticalScrollBarVisibility="Auto" Visibility="Collapsed" Margin="0,0,0,8"/>
+            <StackPanel Name="pnlCleanup"/>
+            <TextBlock Text="Read data can expose existing scans; write data can overwrite files. Some printers need extra rights; test your printer before using this destination." TextWrapping="Wrap" Margin="0,8,0,12"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Name="btnApply" Content="Apply permissions" Width="140" Height="24" IsDefault="True" Margin="0,0,8,0"/>
+                <Button Name="btnCancel" Content="Cancel folder setup" Width="140" Height="24" IsCancel="True"/>
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</Window>
+"@
+	$window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($folderAccessXaml))
+	if ($script:progressWindow) { $window.Owner = $script:progressWindow }
+	$window.Icon = New-PrintMasterIcon
+	Set-WindowTheme $window
+	$window.FindName('txtFolder').Text = "Review folder access: $FolderPath"
+	$window.FindName('txtRecipient').Text = $DesktopUser
+	$identityText = "Desktop user: $DesktopUser. Elevated account: $ElevatedUser."
+	if ([string]::IsNullOrWhiteSpace($DesktopUser)) {
+		$identityText += ' No desktop user was detected. Enter and confirm the receiving user; no administrator fallback is selected.'
+	}
+	elseif ($DesktopUser -ine $ElevatedUser) {
+		$identityText += ' These accounts differ. Applying confirms Full Control for the receiving user shown below, not automatically for the elevated account.'
+	}
+	$window.FindName('txtIdentity').Text = $identityText
+	$window.FindName('txtPolicy').Text = 'New folder: inheritance will be disabled, with only the listed grants (plus Everyone only if selected).'
+	$cleanupBoxes = @()
+	if ($Acl) {
+		$window.FindName('txtPolicy').Text = 'Existing folder: inheritance and custom permissions are preserved. Existing access may exceed the scan profile. Only checked explicit rules below will be removed; matching a legacy Scans rule does not prove Scans created it. Review before applying.'
+		$window.FindName('txtExistingRules').Visibility = 'Visible'
+		$window.FindName('txtExistingRules').Text = ($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
+			"$($_.IdentityReference): $($_.AccessControlType) $($_.FileSystemRights); inherited=$($_.IsInherited); applies=$($_.InheritanceFlags); propagation=$($_.PropagationFlags)"
+		}) -join "`r`n"
+		foreach ($rule in $CleanupRules) {
+			$box = [System.Windows.Controls.CheckBox]::new()
+			$principal = if ($rule.IdentityReference.Value -eq 'S-1-1-0') { 'Everyone' }
+				elseif ($rule.IdentityReference.Value -match '-513$') { 'Domain Users' }
+				else { 'Scan account' }
+			$label = [System.Windows.Controls.TextBlock]::new()
+			$label.Text = "Remove explicit $principal [$($rule.IdentityReference)]: $($rule.FileSystemRights)"
+			$label.TextWrapping = 'Wrap'
+			$label.MaxWidth = 540
+			$box.Content = $label
+			$box.IsChecked = $false
+			$box.Tag = $rule
+			$box.Margin = '0,0,0,6'
+			$window.FindName('pnlCleanup').Children.Add($box) | Out-Null
+			$cleanupBoxes += $box
+		}
+	}
+	$window.FindName('btnApply').IsEnabled = -not [string]::IsNullOrWhiteSpace($DesktopUser)
+	$window.FindName('txtRecipient').Add_TextChanged({
+		$window.FindName('btnApply').IsEnabled = -not [string]::IsNullOrWhiteSpace($window.FindName('txtRecipient').Text)
+	})
+	$window.FindName('btnApply').Add_Click({ $window.DialogResult = $true })
+	if ($window.ShowDialog() -eq $true) {
+		return @{
+			Recipient = $window.FindName('txtRecipient').Text.Trim()
+			AllowEveryoneModify = [bool]$window.FindName('chkEveryone').IsChecked
+			RemoveRules = @($cleanupBoxes | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
+		}
+	}
+	return $null
+}
+
+function Set-ScanFolderAccessRules {
+	param(
+		$Acl,
+		[System.Security.Principal.SecurityIdentifier]$ScanSid,
+		[System.Security.Principal.SecurityIdentifier]$RecipientSid,
+		[bool]$NewFolder,
+		[bool]$AllowEveryoneModify,
+		[array]$RemoveRules
+	)
+
+	if ($ScanSid -eq $RecipientSid) {
+		throw 'The receiving user must differ from the scan account; granting it Full Control would defeat the restricted scan permissions.'
+	}
+	if ($NewFolder) {
+		$Acl.SetAccessRuleProtection($true, $false)
+	}
+	foreach ($rule in $RemoveRules) {
+		$Acl.RemoveAccessRuleSpecific($rule)
+		Write-Verbose "Prepared removal of reviewed explicit folder rule: $($rule.IdentityReference) $($rule.FileSystemRights)."
+	}
+
+	$inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+	$scanRights = [System.Security.AccessControl.FileSystemRights]::ListDirectory -bor
+		[System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+		[System.Security.AccessControl.FileSystemRights]::CreateDirectories
+	$Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($ScanSid, $scanRights, $inheritance, 'None', 'Allow'))
+	foreach ($sid in @($RecipientSid, [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'), [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')) | Select-Object -Unique) {
+		$Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', $inheritance, 'None', 'Allow'))
+	}
+	if ($AllowEveryoneModify) {
+		$Acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'), 'Modify', $inheritance, 'None', 'Allow'))
+		Write-Warning 'Everyone Modify was explicitly selected for the scan folder. Other users may read, change, and delete scans.'
+	}
+}
+
 function Initialize-ScanFolder {
 	param(
 		[string]$FolderPath,
 		[string]$ScanUser,
 		[bool]$SetPermissions,
-		[bool]$DomainJoined
+		[bool]$DomainJoined,
+		[string]$DesktopUser
 	)
 	$results = @()
 
-	# Create folder if missing
+	$folderExists = $false
+	$permissionsApplied = $false
+	$folderCreated = $false
 	try {
-		if (!(Test-Path -Path $FolderPath)) {
-			New-Item -Path $FolderPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+		$folderExists = Test-Path -LiteralPath $FolderPath -ErrorAction Stop
+		if ($SetPermissions) {
+			if (-not $PSBoundParameters.ContainsKey('DesktopUser')) {
+				$DesktopUser = Get-ScanDesktopUser
+			}
+			$folderAcl = if ($folderExists) { Get-Acl -LiteralPath $FolderPath -ErrorAction Stop } else { [System.Security.AccessControl.DirectorySecurity]::new() }
+			$scanSid = Resolve-ScanAccountSid "$env:COMPUTERNAME\$ScanUser"
+			$cleanupRules = @(Get-ScanFolderCleanupRules -Acl $folderAcl -ScanSid $scanSid)
+			$elevatedUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+			$choice = Show-ScanFolderAccessDialog -FolderPath $FolderPath -DesktopUser $DesktopUser -ElevatedUser $elevatedUser -Acl $(if ($folderExists) { $folderAcl }) -CleanupRules $cleanupRules
+			if ($null -eq $choice) {
+				throw [System.OperationCanceledException]::new('Folder setup canceled before creating the folder or changing its permissions. SMB share setup will be skipped.')
+			}
+			$recipientSid = Resolve-ScanAccountSid $choice.Recipient
+			Set-ScanFolderAccessRules -Acl $folderAcl -ScanSid $scanSid -RecipientSid $recipientSid -NewFolder (-not $folderExists) -AllowEveryoneModify $choice.AllowEveryoneModify -RemoveRules $choice.RemoveRules
+		}
+		if (-not $folderExists) {
+			New-Item -Path $FolderPath -ItemType Directory -ErrorAction Stop | Out-Null
+			$folderCreated = $true
 			$results += @{ Status = 'Success'; Message = "Created folder at $FolderPath"; Error = $null }
 		}
 		else {
 			$results += @{ Status = 'Success'; Message = 'Scans folder already exists'; Error = $null }
 		}
+		if ($SetPermissions) {
+			Set-Acl -LiteralPath $FolderPath -AclObject $folderAcl -ErrorAction Stop
+			$permissionsApplied = $true
+			$results += @{ Status = 'Success'; Message = "Folder permissions applied: restricted scan rights; Full Control for '$($choice.Recipient)', Administrators, and SYSTEM."; Error = $null }
+			if ($folderExists) {
+				Write-Warning 'Existing folder inheritance and unselected explicit entries were preserved. Effective access may exceed the scan profile; existing protected child ACLs are not reset.'
+				$results += @{ Status = 'Warning'; Message = 'Existing inheritance and unselected permissions preserved; review effective access and protected child folders/files. This is not a guarantee of restricted effective access.'; Error = $null }
+			}
+		}
 	}
 	catch {
-		$results += @{ Status = 'Failed'; Message = "Failed to create folder at $FolderPath"; Error = $_.Exception.Message }
-		return $results
-	}
-
-	# Set permissions
-	if ($SetPermissions) {
-		try {
-			$folderAcl = Get-Acl $FolderPath -ErrorAction Stop
-			$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($Env:UserName, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-			$folderAcl.SetAccessRule($rule)
-			$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($ScanUser, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-			$folderAcl.SetAccessRule($rule)
-			$rule = New-Object System.Security.AccessControl.FileSystemAccessRule("Everyone", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
-			$folderAcl.SetAccessRule($rule)
-			if ($DomainJoined) {
-				$rule = New-Object System.Security.AccessControl.FileSystemAccessRule("Domain Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
-				$folderAcl.SetAccessRule($rule)
-			}
-			Set-Acl $FolderPath $folderAcl -ErrorAction Stop
-			$results += @{ Status = 'Success'; Message = 'Folder permissions set'; Error = $null }
-		}
-		catch {
-			$results += @{ Status = 'Failed'; Message = 'Failed to set folder permissions'; Error = $_.Exception.Message }
+		$results += @{ Status = 'Failed'; Message = "Failed to prepare scan folder at $FolderPath"; Error = $_.Exception.Message; FolderSetupFailed = $true }
+		if ($SetPermissions -and $folderCreated -and -not $permissionsApplied) {
+			Write-Warning "Restricted permissions were not applied to '$FolderPath'. The folder retains its inherited permissions; SMB share setup will be skipped."
 		}
 	}
 	return $results
@@ -1027,12 +1231,17 @@ else {
 		Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped scan-user folder permissions and SMB share configuration because account setup failed'; Error = $null }
 	}
 
+	$scanFolderConfigured = $true
 	if ($createFolder -eq $true) {
-		$folderResults = Initialize-ScanFolder -FolderPath $folderPath -ScanUser $scanUser -SetPermissions ($setPermissions -and $scanUserConfigured) -DomainJoined $domainJoined
+		$folderResults = @(Initialize-ScanFolder -FolderPath $folderPath -ScanUser $scanUser -SetPermissions ($setPermissions -and $scanUserConfigured) -DomainJoined $domainJoined)
 		foreach ($r in $folderResults) { Show-StepResult $r }
+		$scanFolderConfigured = @($folderResults | Where-Object { $_.FolderSetupFailed }).Count -eq 0
+		if (-not $scanFolderConfigured) {
+			Show-StepResult @{ Status = 'Skipped'; Message = 'Skipped SMB share configuration because folder setup failed or was canceled'; Error = $null }
+		}
 	}
 
-	if ($setShare -eq $true -and $scanUserConfigured) {
+	if ($setShare -eq $true -and $scanUserConfigured -and $scanFolderConfigured) {
 		$shareResult = Initialize-ScanShare -ShareName $shareName -FolderPath $folderPath -ScanUser $scanUser
 		Show-StepResult $shareResult
 	}

@@ -83,6 +83,13 @@ function netsh {
 	throw 'Unmocked netsh'
 }
 
+function Initialize-TestTheme {
+	foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText')) {
+		Set-Variable -Name $name -Value '#002b36' -Scope Script
+	}
+	$script:themeResources = ''
+}
+
 Describe 'Scan account password errors' {
 	BeforeEach {
 		$script:hasLocalAccounts = $true
@@ -332,6 +339,16 @@ Describe 'Account-dependent setup steps' {
 		$script:controls.btnCopyPassword.IsEnabled | Should Be $true
 	}
 
+	It 'does not configure a share when folder permissions fail or their review is canceled' {
+		$script:testUserResults = @{ Status = 'Success'; Error = $null }
+		Mock Initialize-ScanFolder { @{ Status = 'Failed'; Error = 'Folder review canceled'; FolderSetupFailed = $true } }
+		. $script:runSteps
+		Assert-MockCalled Initialize-ScanShare -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It
+		$script:progressWindow.Title | Should Match 'Completed with errors'
+		$script:controls.btnDone.IsEnabled | Should Be $true
+	}
+
 	It 'pauses for replacement passwords until accepted, then resumes all selected steps' {
 		$script:scanPass = 'Rejected'
 		$script:attempts = 0
@@ -505,10 +522,25 @@ Describe 'Account visibility' {
 
 Describe 'Scan folder setup' {
 	BeforeEach {
+		$script:scanSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')
+		$script:recipientSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1002')
+		$script:folderAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$script:resolveRecipientFails = $false
 		Mock Test-Path { $false }
 		Mock New-Item { }
-		Mock Get-Acl { throw 'ACL should not be read' }
+		Mock Get-Acl { $script:folderAcl }
 		Mock Set-Acl { }
+		Mock Get-ScanDesktopUser { 'DOMAIN\recipient' }
+		Mock Resolve-ScanAccountSid {
+			if ($AccountName -eq 'DOMAIN\recipient') {
+				if ($script:resolveRecipientFails) { throw 'Account not found' }
+				$script:recipientSid
+			}
+			else { $script:scanSid }
+		}
+		Mock Show-ScanFolderAccessDialog {
+			@{ Recipient = 'DOMAIN\recipient'; AllowEveryoneModify = $false; RemoveRules = @() }
+		}
 	}
 
 	It 'creates a missing folder without touching disabled permissions' {
@@ -516,6 +548,32 @@ Describe 'Scan folder setup' {
 		$results[0].Status | Should Be 'Success'
 		Assert-MockCalled New-Item -Times 1 -Exactly -Scope It -ParameterFilter { $Path -eq 'C:\scans' -and $ItemType -eq 'Directory' }
 		Assert-MockCalled Get-Acl -Times 0 -Exactly -Scope It
+		Assert-MockCalled Get-ScanDesktopUser -Times 0 -Exactly -Scope It
+	}
+
+	It 'defaults folder review to the user of the UI session rather than the elevated identity' {
+		Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true | Out-Null
+		Assert-MockCalled Get-ScanDesktopUser -Times 1 -Exactly -Scope It
+		Assert-MockCalled Show-ScanFolderAccessDialog -Times 1 -Exactly -Scope It -ParameterFilter {
+			$DesktopUser -eq 'DOMAIN\recipient'
+		}
+	}
+
+	It 'passes an empty detected user to review without substituting the elevated account' {
+		Mock Get-ScanDesktopUser { $null }
+		Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true | Out-Null
+		Assert-MockCalled Show-ScanFolderAccessDialog -Times 1 -Exactly -Scope It -ParameterFilter {
+			[string]::IsNullOrWhiteSpace($DesktopUser)
+		}
+	}
+
+	It 'reports desktop-session lookup failure before modifying the folder' {
+		Mock Get-ScanDesktopUser { throw 'Session identity lookup failed' }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		$results[0].Error | Should Match 'Session identity lookup failed'
+		$results[0].FolderSetupFailed | Should Be $true
+		Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
 	}
 
 	It 'does not recreate an existing folder' {
@@ -530,27 +588,147 @@ Describe 'Scan folder setup' {
 		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -SetPermissions $true)
 		$results.Count | Should Be 1
 		$results[0].Status | Should Be 'Failed'
-		Assert-MockCalled Get-Acl -Times 0 -Exactly -Scope It
-	}
-
-	It 'reports non-terminating ACL read failures' {
-		Mock Get-Acl { Write-Error 'Access is denied' }
-		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -SetPermissions $true)
-		$results[1].Status | Should Be 'Failed'
+		$results[0].FolderSetupFailed | Should Be $true
 		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
 	}
 
-	It 'sets the intended ACL rules including Domain Users only on joined computers' {
-		$script:ruleCount = 0
-		$script:fakeAcl = [pscustomobject]@{}
-		$script:fakeAcl | Add-Member ScriptMethod SetAccessRule { param($rule) $script:ruleCount++ }
-		Mock Get-Acl { $script:fakeAcl }
-		Mock New-Object { 'Mock access rule' } -ParameterFilter { $TypeName -like 'System.Security.AccessControl.FileSystemAccessRule*' }
-		Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true | Out-Null
-		$script:ruleCount | Should Be 3
-		Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true -DomainJoined $true | Out-Null
-		$script:ruleCount | Should Be 7
+	It 'reports non-terminating ACL read failures' {
+		Mock Test-Path { $true }
+		Mock Get-Acl { Write-Error 'Access is denied' }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -SetPermissions $true)
+		$results[0].Status | Should Be 'Failed'
+		$results[0].FolderSetupFailed | Should Be $true
+		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
+	}
+
+	It 'writes a protected new-folder ACL with the exact restricted rights on domain and non-domain PCs' {
+		foreach ($joined in @($false, $true)) {
+			$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -DesktopUser 'DOMAIN\recipient' -SetPermissions $true -DomainJoined $joined)
+			$results[-1].Status | Should Be 'Success'
+			Assert-MockCalled Set-Acl -Scope It -ParameterFilter {
+				$rules = @($AclObject.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+				$scanRule = @($rules | Where-Object { $_.IdentityReference.Value -eq $script:scanSid.Value })
+				$AclObject.AreAccessRulesProtected -and $rules.Count -eq 4 -and $scanRule.Count -eq 1 -and
+				[int]$scanRule[0].FileSystemRights -eq 1048583 -and
+				$scanRule[0].InheritanceFlags -eq 'ContainerInherit,ObjectInherit'
+			}
+		}
 		Assert-MockCalled Set-Acl -Times 2 -Exactly -Scope It
+	}
+
+	It 'cancels before creating a folder or writing any ACL' {
+		Mock Show-ScanFolderAccessDialog { $null }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		$results[0].FolderSetupFailed | Should Be $true
+		$results[0].Error | Should Match 'canceled'
+		Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
+	}
+
+	It 'does not modify an existing folder when its review is canceled' {
+		Mock Test-Path { $true }
+		Mock Show-ScanFolderAccessDialog { $null }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		$results[0].FolderSetupFailed | Should Be $true
+		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
+		$script:folderAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]).Count | Should Be 0
+	}
+
+	It 'fails explicitly before creation if a receiving user cannot be resolved' {
+		$script:resolveRecipientFails = $true
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		$results[0].Error | Should Match 'Account not found'
+		Assert-MockCalled New-Item -Times 0 -Exactly -Scope It
+		Assert-MockCalled Set-Acl -Times 0 -Exactly -Scope It
+	}
+
+	It 'reports ACL write failure and never claims permissions were applied' {
+		Mock Set-Acl { Write-Error 'Access is denied' }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		$results[-1].FolderSetupFailed | Should Be $true
+		@($results | Where-Object { $_.Message -like 'Folder permissions applied*' }).Count | Should Be 0
+	}
+
+	It 'logs retained inherited and custom access on an existing folder' {
+		Mock Test-Path { $true }
+		$results = @(Initialize-ScanFolder -FolderPath 'C:\scans' -ScanUser scans -SetPermissions $true)
+		($results | Where-Object { $_.Error } | ForEach-Object { $_.Error } | Out-String).Trim() | Should BeNullOrEmpty
+		$results[-1].Status | Should Be 'Warning'
+		$results[-1].Message | Should Match 'not a guarantee'
+		$script:folderAcl.AreAccessRulesProtected | Should Be $false
+	}
+}
+
+Describe 'Folder ACL policy' {
+	BeforeEach {
+		$script:scanSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')
+		$script:recipientSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1002')
+		$script:folderAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+	}
+
+	It 'grants Full Control to the recipient, local Administrators, and SYSTEM using SIDs' {
+		Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:recipientSid -NewFolder $true
+		$rules = @($script:folderAcl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+		foreach ($sid in @($script:recipientSid.Value, 'S-1-5-32-544', 'S-1-5-18')) {
+			$rule = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
+			$rule.Count | Should Be 1
+			$rule[0].FileSystemRights | Should Be ([System.Security.AccessControl.FileSystemRights]::FullControl)
+			$rule[0].InheritanceFlags | Should Be ([System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit')
+			$rule[0].PropagationFlags | Should Be 'None'
+		}
+	}
+
+	It 'never gives the scan account the receiving users Full Control grant' {
+		{ Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:scanSid -NewFolder $true } | Should Throw 'must differ'
+		$script:folderAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]).Count | Should Be 0
+	}
+
+	It 'grants Everyone Modify only after an explicit opt-in' {
+		Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:recipientSid -NewFolder $true -AllowEveryoneModify $true
+		$rules = @($script:folderAcl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+		$rule = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' })
+		$rule.Count | Should Be 1
+		[int]$rule[0].FileSystemRights | Should Be 1245631
+	}
+
+	It 'identifies only exact explicit legacy-shaped rules as cleanup candidates' {
+		$script:folderAcl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;0x1301bf;;;WD)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;0x1301bf;;;S-1-5-21-1-2-3-513)(A;;0x1301bf;;;WD)(A;OICI;FR;;;S-1-5-21-1-2-3-1003)(A;OICIID;0x1301bf;;;WD)')
+		$candidates = @(Get-ScanFolderCleanupRules -Acl $script:folderAcl -ScanSid $script:scanSid)
+		$candidates.Count | Should Be 3
+		@($candidates | Where-Object { $_.IsInherited }).Count | Should Be 0
+	}
+
+	It 'preserves all existing access including inherited broad grants unless explicitly selected' {
+		$script:folderAcl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;0x1301bf;;;WD)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FR;;;S-1-5-21-1-2-3-1003)(A;OICIID;0x1301bf;;;WD)')
+		Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:recipientSid
+		$rules = @($script:folderAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+		$script:folderAcl.AreAccessRulesProtected | Should Be $false
+		@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count | Should Be 2
+		@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-21-1-2-3-1003' }).Count | Should Be 1
+		@($rules | Where-Object { $_.IdentityReference.Value -eq $script:scanSid.Value })[0].FileSystemRights | Should Be ([System.Security.AccessControl.FileSystemRights]::FullControl)
+	}
+
+	It 'removes only approved exact entries and preserves custom and inherited ACEs' {
+		$script:folderAcl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;0x1301bf;;;WD)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FR;;;S-1-5-21-1-2-3-1003)(A;OICIID;0x1301bf;;;WD)')
+		$candidates = @(Get-ScanFolderCleanupRules -Acl $script:folderAcl -ScanSid $script:scanSid)
+		Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:recipientSid -RemoveRules $candidates
+		$rules = @($script:folderAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+		$everyone = @($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' })
+		$everyone.Count | Should Be 1
+		$everyone[0].IsInherited | Should Be $true
+		$scanRule = @($rules | Where-Object { $_.IdentityReference.Value -eq $script:scanSid.Value })
+		[int]$scanRule[0].FileSystemRights | Should Be 1048583
+		@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-21-1-2-3-1003' }).Count | Should Be 1
+	}
+
+	It 'retains a protected existing folder instead of enabling inheritance' {
+		$script:folderAcl.SetAccessRuleProtection($true, $false)
+		Set-ScanFolderAccessRules -Acl $script:folderAcl -ScanSid $script:scanSid -RecipientSid $script:recipientSid
+		$script:folderAcl.AreAccessRulesProtected | Should Be $true
+	}
+
+	It 'rejects a blank receiving account rather than selecting the elevated account' {
+		{ Resolve-ScanAccountSid '' } | Should Throw 'Choose the receiving Windows user'
 	}
 }
 
@@ -722,10 +900,7 @@ Describe 'Password correction dialog' {
 		Add-Type -AssemblyName PresentationFramework
 		$script:progressWindow = $null
 		$script:scanPass = 'Rejected'
-		foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText')) {
-			Set-Variable -Name $name -Value '#002b36' -Scope Script
-		}
-		$script:themeResources = ''
+		Initialize-TestTheme
 		Mock New-RandomPassword { 'GeneratedReplacement123!' }
 		Mock Set-WindowTheme {
 			$window | Add-Member ScriptMethod ShowDialog {
@@ -758,6 +933,80 @@ Describe 'Password correction dialog' {
 	}
 }
 
+Describe 'Folder access review dialog' {
+	BeforeEach {
+		Add-Type -AssemblyName PresentationFramework
+		Initialize-TestTheme
+		$script:progressWindow = $null
+		$script:accessAccepted = $true
+		$script:inspectAccessWindow = { param($window) }
+		Mock Set-WindowTheme {
+			$window | Add-Member ScriptMethod ShowDialog {
+				& $script:inspectAccessWindow $this
+				return $script:accessAccepted
+			} -Force
+		}
+	}
+
+	It 'defaults to the desktop user and explicitly discloses a different elevated identity' {
+		$script:inspectAccessWindow = {
+			param($window)
+			$window.FindName('txtIdentity').Text | Should Match 'These accounts differ'
+			$window.FindName('txtIdentity').Text | Should Match 'not automatically for the elevated account'
+			$window.FindName('txtRecipient').Text | Should Be 'DOMAIN\recipient'
+			$window.FindName('chkEveryone').IsChecked | Should Be $false
+			$window.FindName('txtPolicy').Text | Should Match 'inheritance will be disabled'
+			$window.FindName('btnApply').IsEnabled | Should Be $true
+		}
+		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'DOMAIN\recipient' -ElevatedUser 'PC\admin'
+		$result.Recipient | Should Be 'DOMAIN\recipient'
+		$result.AllowEveryoneModify | Should Be $false
+		$result.RemoveRules.Count | Should Be 0
+	}
+
+	It 'requires an explicit receiving user when no desktop user was detected' {
+		$script:inspectAccessWindow = {
+			param($window)
+			$window.FindName('txtRecipient').Text | Should BeNullOrEmpty
+			$window.FindName('txtIdentity').Text | Should Match 'No desktop user was detected'
+			$window.FindName('btnApply').IsEnabled | Should Be $false
+			$window.FindName('txtRecipient').Text = '   '
+			$window.FindName('btnApply').IsEnabled | Should Be $false
+			$window.FindName('txtRecipient').Text = ' PC\recipient '
+			$window.FindName('btnApply').IsEnabled | Should Be $true
+		}
+		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -ElevatedUser 'PC\admin'
+		$result.Recipient | Should Be 'PC\recipient'
+	}
+
+	It 'shows existing ACLs and removes only individually checked legacy-shaped rules' {
+		$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+		$acl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;0x1301bf;;;WD)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)')
+		$candidates = @(Get-ScanFolderCleanupRules -Acl $acl -ScanSid ([System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')))
+		$script:inspectAccessWindow = {
+			param($window)
+			$window.FindName('txtPolicy').Text | Should Match 'inheritance and custom permissions are preserved'
+			$window.FindName('txtExistingRules').Text | Should Match 'S-1-1-0'
+			$boxes = $window.FindName('pnlCleanup').Children
+			$boxes.Count | Should Be 2
+			foreach ($box in $boxes) { $box.IsChecked | Should Be $false }
+			$boxes[0].IsChecked = $true
+			$window.FindName('chkEveryone').IsChecked = $true
+		}
+		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' -Acl $acl -CleanupRules $candidates
+		$result.AllowEveryoneModify | Should Be $true
+		$result.RemoveRules.Count | Should Be 1
+		$result.RemoveRules[0].IdentityReference.Value | Should Be $candidates[0].IdentityReference.Value
+	}
+
+	It 'returns no permission choices when canceled or closed' {
+		foreach ($accepted in @($false, $null)) {
+			$script:accessAccepted = $accepted
+			Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'PC\recipient' -ElevatedUser 'PC\admin' | Should BeNullOrEmpty
+		}
+	}
+}
+
 Describe 'WPF window markup' {
 	It 'renders the embedded PrintMaster window logo without external files' {
 		Add-Type -AssemblyName PresentationFramework
@@ -777,7 +1026,7 @@ Describe 'WPF window markup' {
 		$offset = (32 * 64 + 46) * 4
 		($pixels[$offset..($offset + 3)] -join ',') | Should Be '120,187,72,255'
 		$source = Get-Content $sourcePath -Raw
-		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 4
+		([regex]::Matches($source, '\.Icon = New-PrintMasterIcon')).Count | Should Be 5
 		$source | Should Match "Initialize-DesktopShortcut -FolderPath .folderPath -IconPath .iconPath"
 		$source | Should Match '\[IO.File\]::WriteAllBytes\(\$iconPath, \[Convert\]::FromBase64String\(\$script:appIconBase64\)\)'
 	}
@@ -815,9 +1064,7 @@ Describe 'WPF window markup' {
 
 	It 'loads setup and progress windows without displaying them or running setup' {
 		Add-Type -AssemblyName PresentationFramework
-		foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText')) {
-			Set-Variable -Name $name -Value '#002b36' -Scope Script
-		}
+		Initialize-TestTheme
 		foreach ($name in @('$script:themeResources', '$setupXaml', '$progressXaml', '$passwordRetryXaml')) {
 			$assignment = $ast.Find({
 				param($node)
