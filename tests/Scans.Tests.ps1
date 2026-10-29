@@ -45,6 +45,7 @@ function net {
 	throw 'Unmocked net'
 }
 function Get-CimInstance {
+	[CmdletBinding()]
 	param([string]$ClassName)
 	throw 'Unmocked Get-CimInstance'
 }
@@ -55,13 +56,23 @@ function Get-SmbShare {
 }
 function New-SmbShare {
 	[CmdletBinding()]
-	param($Name, $Path, $FullAccess)
+	param($Name, $Path, $FullAccess, $ChangeAccess)
 	throw 'Unmocked New-SmbShare'
 }
 function Grant-SmbShareAccess {
 	[CmdletBinding()]
 	param($Name, $AccountName, $AccessRight, [switch]$Force)
 	throw 'Unmocked Grant-SmbShareAccess'
+}
+function Get-SmbShareAccess {
+	[CmdletBinding()]
+	param($Name)
+	throw 'Unmocked Get-SmbShareAccess'
+}
+function Revoke-SmbShareAccess {
+	[CmdletBinding()]
+	param($Name, $AccountName, [switch]$Force)
+	throw 'Unmocked Revoke-SmbShareAccess'
 }
 function Get-NetConnectionProfile { throw 'Unmocked Get-NetConnectionProfile' }
 function Set-NetConnectionProfile {
@@ -87,7 +98,12 @@ function Initialize-TestTheme {
 	foreach ($name in @('thBg', 'thBgAlt', 'thFg', 'thFgEm', 'thFgStrong', 'thAccent', 'thAccentHi', 'thBorder', 'thBtnText')) {
 		Set-Variable -Name $name -Value '#002b36' -Scope Script
 	}
-	$script:themeResources = ''
+	$themeAssignment = $ast.Find({
+		param($node)
+		$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+		$node.Left.Extent.Text -eq '$script:themeResources'
+	}, $true)
+	. ([scriptblock]::Create($themeAssignment.Extent.Text))
 }
 
 Describe 'Scan account password errors' {
@@ -337,6 +353,18 @@ Describe 'Account-dependent setup steps' {
 		Assert-MockCalled Initialize-ScanFolder -Times 1 -Exactly -Scope It -ParameterFilter { $SetPermissions }
 		Assert-MockCalled Initialize-ScanShare -Times 1 -Exactly -Scope It
 		$script:controls.btnCopyPassword.IsEnabled | Should Be $true
+	}
+
+	It 'retains a replacement share name and reports share failures without stopping independent steps' {
+		$script:testUserResults = @{ Status = 'Success'; Error = $null }
+		Mock Initialize-ScanShare { @{ Status = 'Success'; ShareName = 'printer-scans'; Error = $null } }
+		. $script:runSteps
+		$script:shareName | Should Be 'printer-scans'
+		Mock Initialize-ScanShare { @{ Status = 'Failed'; Error = 'Share review canceled' } }
+		. $script:runSteps
+		$script:shareName | Should Be 'printer-scans'
+		$script:progressWindow.Title | Should Match 'Completed with errors'
+		Assert-MockCalled Initialize-DesktopShortcut -Times 2 -Exactly -Scope It
 	}
 
 	It 'does not configure a share when folder permissions fail or their review is canceled' {
@@ -735,22 +763,41 @@ Describe 'Folder ACL policy' {
 Describe 'SMB share setup' {
 	BeforeEach {
 		$script:hasSmbShareCmdlets = $true
+		$script:shareScanSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')
+		$script:shareAccess = @([pscustomobject]@{ AccountName = 'Everyone'; AccessControlType = 'Allow'; AccessRight = 'Full' })
+		Mock Test-Path { $true }
+		Mock Resolve-ScanAccountSid {
+			if ($AccountName -eq 'Everyone') { return [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0') }
+			return $script:shareScanSid
+		}
+		Mock Resolve-ScanPrincipalDisplay { "TEST\$($Sid.Value)" }
 		Mock Get-SmbShare { $null }
+		Mock Get-SmbShareAccess { $script:shareAccess }
 		Mock New-SmbShare { }
 		Mock Grant-SmbShareAccess { }
+		Mock Revoke-SmbShareAccess { }
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @() } }
+		Mock Show-ScanShareConflictDialog { $null }
+		Mock Get-CimInstance { @() }
+		Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 0 } }
+		Mock net { throw 'Share setup must not call net share.' }
 	}
 
-	It 'creates a share when no shares exist' {
+	It 'creates a share with Change only for the explicitly local scan account' {
 		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
 		$result.Status | Should Be 'Success'
-		Assert-MockCalled New-SmbShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'scans' -and $FullAccess -eq 'scans' }
+		$result.ShareName | Should Be 'scans'
+		Assert-MockCalled New-SmbShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'scans' -and $ChangeAccess -eq "$env:COMPUTERNAME\scans" -and -not $FullAccess }
+		Assert-MockCalled Show-ScanShareAccessDialog -Times 0 -Exactly -Scope It
 	}
 
-	It 'matches existing share names case-insensitively and exactly' {
-		Mock Get-SmbShare { [pscustomobject]@{ Name = 'SCANS' } }
+	It 'matches existing share names and normalized paths case-insensitively' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'SCANS'; Path = 'c:\scans\.' } }
 		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
 		$result.Status | Should Be 'Success'
-		Assert-MockCalled Grant-SmbShareAccess -Times 1 -Exactly -Scope It
+		Assert-MockCalled Show-ScanShareAccessDialog -Times 1 -Exactly -Scope It
+		Assert-MockCalled Grant-SmbShareAccess -Times 1 -Exactly -Scope It -ParameterFilter { $AccessRight -eq 'Change' }
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
 		Assert-MockCalled New-SmbShare -Times 0 -Exactly -Scope It
 	}
 
@@ -760,41 +807,322 @@ Describe 'SMB share setup' {
 		Assert-MockCalled New-SmbShare -Times 1 -Exactly -Scope It
 	}
 
-	It 'reports share lookup, creation, and permission errors' {
+	It 'cancels a path conflict without touching the unrelated share' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'D:\other' } }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Status | Should Be 'Failed'
+		$result.Error | Should Match 'canceled'
+		Assert-MockCalled Show-ScanShareConflictDialog -Times 1 -Exactly -Scope It
+		Assert-MockCalled Get-SmbShareAccess -Times 0 -Exactly -Scope It
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+		Assert-MockCalled New-SmbShare -Times 0 -Exactly -Scope It
+	}
+
+	It 'checks a replacement name and reports the name actually created' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'D:\other' } }
+		Mock Show-ScanShareConflictDialog { 'printer-scans' }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Status | Should Be 'Success'
+		$result.ShareName | Should Be 'printer-scans'
+		Assert-MockCalled New-SmbShare -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'printer-scans' }
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'does not modify an existing share when access review is canceled' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		Mock Show-ScanShareAccessDialog { $null }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Error | Should Match 'canceled'
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'removes only explicitly selected Allow grants and grants scan Change' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @('Everyone') } }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Status | Should Be 'Success'
+		Assert-MockCalled Revoke-SmbShareAccess -Times 1 -Exactly -Scope It -ParameterFilter { $AccountName -eq 'Everyone' }
+		Assert-MockCalled Grant-SmbShareAccess -Times 1 -Exactly -Scope It -ParameterFilter { $AccessRight -eq 'Change' }
+	}
+
+	It 'preserves existing scan Full unless explicitly selected for reduction' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		$script:shareAccess = @([pscustomobject]@{ AccountName = 'TEST\scan'; AccessControlType = 'Allow'; AccessRight = 'Full' })
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Success'
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @('TEST\scan') } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Success'
+		Assert-MockCalled Revoke-SmbShareAccess -Times 1 -Exactly -Scope It -ParameterFilter { $AccountName -eq 'TEST\scan' }
+		Assert-MockCalled Grant-SmbShareAccess -Times 1 -Exactly -Scope It -ParameterFilter { $AccessRight -eq 'Change' }
+	}
+
+	It 'rejects unreviewed and Deny removal requests' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		$script:shareAccess += [pscustomobject]@{ AccountName = 'TEST\blocked'; AccessControlType = 'Deny'; AccessRight = 'Full' }
+		foreach ($name in @('TEST\blocked', 'UNREVIEWED')) {
+			$script:removeShareAccount = $name
+			Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @($script:removeShareAccount) } }
+			(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
+		}
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'rejects ambiguous duplicate Allow entries for account-wide removal' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		$script:shareAccess += [pscustomobject]@{ AccountName = 'Everyone'; AccessControlType = 'Allow'; AccessRight = 'Read' }
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @('Everyone') } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'treats SID aliases as one principal when checking removal ambiguity' {
+		$access = @(
+			[pscustomobject]@{ AccountName = 'TEST\scan'; AccessControlType = 'Allow'; AccessRight = 'Full' }
+			[pscustomobject]@{ AccountName = $script:shareScanSid.Value; AccessControlType = 'Allow'; AccessRight = 'Read' }
+		)
+		$rows = @(Get-ScanShareAccessRows -Access $access -ScanSid $script:shareScanSid)
+		@($rows | Where-Object { $_.CanRemove }).Count | Should Be 0
+	}
+
+	It 'does not repeat grants when the scan account already has Change' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		$script:shareAccess = @([pscustomobject]@{ AccountName = $script:shareScanSid.Value; AccessControlType = 'Allow'; AccessRight = 'Change' })
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Success'
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'labels unresolved named principals without confusing them with the scan account' {
+		Mock Resolve-ScanAccountSid { throw [System.Security.Principal.IdentityNotMappedException]::new('Unavailable identity') }
+		$rows = @(Get-ScanShareAccessRows -Access $script:shareAccess -ScanSid $script:shareScanSid)
+		$rows[0].Principal | Should Be 'Unresolved account (Everyone)'
+		$rows[0].IsScan | Should Be $false
+		$rows[0].Remove | Should Be $false
+	}
+
+	It 'fails closed for unreadable and unsupported ACL shapes' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		foreach ($access in @(
+			@(),
+			@([pscustomobject]@{ AccountName = 'Everyone'; AccessControlType = 'Unknown'; AccessRight = 'Full' })
+		)) {
+			$script:shareAccess = $access
+			(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
+		}
+		Assert-MockCalled Show-ScanShareAccessDialog -Times 0 -Exactly -Scope It
+	}
+
+	It 'stops when the share path changes during review' {
+		$script:shareReviewed = $false
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = $(if ($script:shareReviewed) { 'D:\other' } else { 'C:\scans' }) } }
+		Mock Show-ScanShareAccessDialog { $script:shareReviewed = $true; @{ RemoveAccounts = @('Everyone') } }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Error | Should Match 'changed during review'
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'stops when the ACL changes during review' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		Mock Show-ScanShareAccessDialog {
+			$script:shareAccess = @([pscustomobject]@{ AccountName = 'Everyone'; AccessControlType = 'Allow'; AccessRight = 'Read' })
+			@{ RemoveAccounts = @('Everyone') }
+		}
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Error | Should Match 'changed during review'
+		Assert-MockCalled Revoke-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'reports partial changes when a later grant fails without claiming rollback' {
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @('Everyone') } }
+		Mock Grant-SmbShareAccess { Write-Error 'Grant denied' }
+		$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
+		$result.Status | Should Be 'Failed'
+		$result.Error | Should Match 'Grant denied'
+		$result.Error | Should Match 'Partial updates already applied.*Everyone.*No rollback'
+	}
+
+	It 'fails closed for missing folders and invalid or special names' {
+		foreach ($name in @('', 'scans$', 'bad/name', 'bad*name', ' scans')) {
+			(Initialize-ScanShare -ShareName $name -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
+		}
+		Mock Test-Path { $false }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\missing' -ScanUser scans).Status | Should Be 'Failed'
+		Assert-MockCalled New-SmbShare -Times 0 -Exactly -Scope It
+	}
+
+	It 'rejects relative and UNC paths instead of guessing equivalence' {
+		foreach ($path in @('scans', '\\server\scans', 'C:scans')) {
+			{ ConvertTo-ScanSharePath $path } | Should Throw 'absolute local drive path'
+		}
+	}
+
+	It 'refuses duplicate scoped and special shares' {
+		Mock Get-SmbShare { @([pscustomobject]@{ Name = 'scans'; Path = 'C:\scans'; ScopeName = 'A' }, [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans'; ScopeName = 'B' }) }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'Multiple scoped'
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans'; Special = $true } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'special share'
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans'; ScopeName = 'SERVER' } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'is scoped'
+		Assert-MockCalled Grant-SmbShareAccess -Times 0 -Exactly -Scope It
+	}
+
+	It 'reports share lookup, creation, ACL-read, revoke and permission errors' {
 		Mock Get-SmbShare { Write-Error 'Access is denied' }
-		(Initialize-ScanShare -ShareName scans).Status | Should Be 'Failed'
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
 		Mock Get-SmbShare { $null }
 		Mock New-SmbShare { Write-Error 'Access is denied' }
-		(Initialize-ScanShare -ShareName scans).Status | Should Be 'Failed'
-		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans' } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
+		Mock Get-SmbShare { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		Mock Get-SmbShareAccess { Write-Error 'ACL read denied' }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'ACL read denied'
+		Mock Get-SmbShareAccess { $script:shareAccess }
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @('Everyone') } }
+		Mock Revoke-SmbShareAccess { Write-Error 'Revoke denied' }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'Revoke denied'
+		Mock Show-ScanShareAccessDialog { @{ RemoveAccounts = @() } }
 		Mock Grant-SmbShareAccess { Write-Error 'Access is denied' }
-		(Initialize-ScanShare -ShareName scans).Status | Should Be 'Failed'
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Failed'
 	}
 
-	It 'handles successful legacy creation and updates' {
+	It 'creates legacy shares through a create-only WMI method with an explicit Change DACL' {
 		$script:hasSmbShareCmdlets = $false
-		Mock net {
-			if (-not $Password) { $global:LASTEXITCODE = $script:lookupExitCode }
-			else { $global:LASTEXITCODE = 0 }
-		}
-		foreach ($code in @(2, 0)) {
-			$script:lookupExitCode = $code
-			(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Success'
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Status | Should Be 'Success'
+		Assert-MockCalled Invoke-CimMethod -Times 1 -Exactly -Scope It -ParameterFilter {
+			$ClassName -eq 'Win32_Share' -and $MethodName -eq 'Create' -and $Arguments.Type -eq 0 -and
+			$Arguments.Access.ControlFlags -eq 4 -and $Arguments.Access.DACL.Count -eq 1 -and
+			$Arguments.Access.DACL[0].AccessMask -eq 1245631 -and $Arguments.Access.DACL[0].AceType -eq 0 -and
+			[System.Security.Principal.SecurityIdentifier]::new([byte[]]$Arguments.Access.DACL[0].Trustee.SID, 0).Value -eq $script:shareScanSid.Value
 		}
 	}
 
-	It 'reports legacy write failures for both creation and update' {
+	It 'refuses legacy existing-share edits without invoking a writer' {
 		$script:hasSmbShareCmdlets = $false
-		Mock net {
-			if (-not $Password) { $global:LASTEXITCODE = $script:lookupExitCode }
-			else { $global:LASTEXITCODE = 2; 'Access is denied' }
+		Mock Get-CimInstance { [pscustomobject]@{ Name = 'scans'; Path = 'C:\scans' } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'Without SMB cmdlets'
+		Assert-MockCalled Invoke-CimMethod -Times 0 -Exactly -Scope It
+		Assert-MockCalled net -Times 0 -Exactly -Scope It
+	}
+
+	It 'does not treat a legacy lookup failure as share absence' {
+		$script:hasSmbShareCmdlets = $false
+		Mock Get-CimInstance { Write-Error 'WMI denied' }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'WMI denied'
+		Assert-MockCalled Invoke-CimMethod -Times 0 -Exactly -Scope It
+	}
+
+	It 'also detects legacy path conflicts before attempting to create anything' {
+		$script:hasSmbShareCmdlets = $false
+		Mock Get-CimInstance { [pscustomobject]@{ Name = 'scans'; Path = 'D:\other' } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'canceled'
+		Assert-MockCalled Show-ScanShareConflictDialog -Times 1 -Exactly -Scope It
+		Assert-MockCalled Invoke-CimMethod -Times 0 -Exactly -Scope It
+	}
+
+	It 'reports legacy creation return codes and CIM errors' {
+		$script:hasSmbShareCmdlets = $false
+		Mock Invoke-CimMethod { [pscustomobject]@{ ReturnValue = 22 } }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'return code 22'
+		Mock Invoke-CimMethod { Write-Error 'Create denied' }
+		(Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans).Error | Should Match 'Create denied'
+	}
+}
+
+Describe 'SMB share review dialogs' {
+	BeforeEach {
+		Add-Type -AssemblyName PresentationFramework
+		Initialize-TestTheme
+		$script:progressWindow = $null
+		$script:shareDialogAccepted = $true
+		$script:inspectShareWindow = { param($window) }
+		Mock Set-WindowTheme {
+			$window | Add-Member ScriptMethod ShowDialog {
+				& $script:inspectShareWindow $this
+				return $script:shareDialogAccepted
+			} -Force
 		}
-		foreach ($code in @(2, 0)) {
-			$script:lookupExitCode = $code
-			$result = Initialize-ScanShare -ShareName scans -FolderPath 'C:\scans' -ScanUser scans
-			$result.Status | Should Be 'Failed'
-			$result.Error | Should Match 'Access is denied'
+		$script:shareDialogRows = @(
+			[pscustomobject]@{ Principal = 'Everyone'; AccountName = 'Everyone'; Type = 'Allow'; Access = 'Full'; CanRemove = $true; Remove = $false; Icon = [char]0xE73E }
+			[pscustomobject]@{ Principal = 'TEST\blocked'; AccountName = 'TEST\blocked'; Type = 'Deny'; Access = 'Full'; CanRemove = $false; Remove = $false; Icon = [char]0xE711 }
+		)
+	}
+
+	It 'shows all entries and warnings with Cancel as the keyboard default' {
+		$script:inspectShareWindow = {
+			param($window)
+			$window.FindName('btnCancel').IsDefault | Should Be $true
+			$window.FindName('txtScanAccess').Text | Should Match 'TEST\\scan.*Change'
+			$window.FindName('txtAccessWarning').Text | Should Match 'groups.*Unselected entries stay.*Deny'
+			$rows = $window.FindName('lstShareAccess').ItemsSource
+			$rows.Count | Should Be 2
+			$rows[0].Remove | Should Be $false
+			$rows[1].CanRemove | Should Be $false
+			$rows[0].Remove = $true
+			$rows[1].Remove = $true
 		}
+		$result = Show-ScanShareAccessDialog -ShareName 'scans & <demo>' -FolderPath 'C:\scans & <demo>' -ScanAccount 'TEST\scan' -Rows $script:shareDialogRows
+		$result.RemoveAccounts.Count | Should Be 1
+		$result.RemoveAccounts[0] | Should Be 'Everyone'
+	}
+
+	It 'returns no ACL or replacement-name choices on cancel or close' {
+		foreach ($accepted in @($false, $null)) {
+			$script:shareDialogAccepted = $accepted
+			Show-ScanShareAccessDialog -ShareName scans -Rows $script:shareDialogRows | Should BeNullOrEmpty
+			Show-ScanShareConflictDialog -ShareName scans -ExistingPath 'D:\other' -FolderPath 'C:\scans' | Should BeNullOrEmpty
+		}
+	}
+
+	It 'requires nonblank replacement names and treats runtime text as text, not markup' {
+		$script:inspectShareWindow = {
+			param($window)
+			$window.FindName('txtMessage').Text | Should Match ([regex]::Escape('D:\other & <folder>'))
+			$window.FindName('btnAccept').IsEnabled | Should Be $false
+			$window.FindName('txtShareName').Text = '   '
+			$window.FindName('btnAccept').IsEnabled | Should Be $false
+			$window.FindName('txtShareName').Text = ' printer-scans '
+			$window.FindName('btnAccept').IsEnabled | Should Be $true
+			$window.FindName('btnCancel').IsDefault | Should Be $true
+		}
+		Show-ScanShareConflictDialog -ShareName scans -ExistingPath 'D:\other & <folder>' -FolderPath 'C:\scans' | Should Be 'printer-scans'
+	}
+
+	It 'updates removal through the actual checkbox binding' {
+		$script:shareBindingError = $null
+		Mock Set-WindowTheme {
+			$window.WindowStartupLocation = 'Manual'
+			$window.Left = -32000
+			$window.Top = -32000
+			$window.ShowActivated = $false
+			$window.Add_ContentRendered({
+				try {
+					$table = $this.FindName('lstShareAccess')
+					$table.UpdateLayout()
+					$pending = [System.Collections.Generic.Queue[System.Windows.DependencyObject]]::new()
+					$pending.Enqueue($table.ItemContainerGenerator.ContainerFromIndex(0))
+					$checkbox = $null
+					while ($pending.Count -and -not $checkbox) {
+						$node = $pending.Dequeue()
+						if ($node -is [System.Windows.Controls.CheckBox]) { $checkbox = $node }
+						else {
+							for ($i = 0; $i -lt [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($node); $i++) {
+								$pending.Enqueue([System.Windows.Media.VisualTreeHelper]::GetChild($node, $i))
+							}
+						}
+					}
+					if (-not $checkbox) { throw 'Share removal checkbox was not rendered.' }
+					$checkbox.IsChecked = $true
+				}
+				catch { $script:shareBindingError = $_.Exception.Message }
+				finally { $this.DialogResult = $true }
+			})
+		}
+		$result = Show-ScanShareAccessDialog -ShareName scans -FolderPath 'C:\scans' -ScanAccount 'TEST\scan' -Rows $script:shareDialogRows
+		$script:shareBindingError | Should BeNullOrEmpty
+		$result.RemoveAccounts.Count | Should Be 1
+		$result.RemoveAccounts[0] | Should Be 'Everyone'
 	}
 }
 

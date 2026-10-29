@@ -208,6 +208,32 @@ $script:themeResources = @"
             <Setter Property="Foreground" Value="$($script:thFg)"/>
             <Setter Property="BorderBrush" Value="$($script:thBorder)"/>
         </Style>
+        <Style TargetType="GridViewColumnHeader">
+            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            <Setter Property="Background" Value="$($script:thBgAlt)"/>
+            <Setter Property="Padding" Value="8,7"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="GridViewColumnHeader">
+                        <Border Background="{TemplateBinding Background}" BorderBrush="$($script:thBorder)" BorderThickness="0,0,0,1" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ListViewItem">
+            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            <Setter Property="Padding" Value="0,8"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="$($script:thBgAlt)"/>
+                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
         <Style TargetType="{x:Type ScrollBar}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
             <Setter Property="Background" Value="$($script:thBgAlt)"/>
             <Setter Property="Template">
@@ -687,32 +713,6 @@ function Show-ScanFolderAccessDialog {
                     <Setter Property="FontSize" Value="15"/>
                     <Setter Property="Margin" Value="0,0,0,8"/>
                 </Style>
-                <Style TargetType="GridViewColumnHeader">
-                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
-                    <Setter Property="Background" Value="$($script:thBgAlt)"/>
-                    <Setter Property="Padding" Value="8,7"/>
-                    <Setter Property="HorizontalContentAlignment" Value="Left"/>
-                    <Setter Property="Template">
-                        <Setter.Value>
-                            <ControlTemplate TargetType="GridViewColumnHeader">
-                                <Border Background="{TemplateBinding Background}" BorderBrush="$($script:thBorder)" BorderThickness="0,0,0,1" Padding="{TemplateBinding Padding}">
-                                    <ContentPresenter/>
-                                </Border>
-                            </ControlTemplate>
-                        </Setter.Value>
-                    </Setter>
-                </Style>
-                <Style TargetType="ListViewItem">
-                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
-                    <Setter Property="Padding" Value="0,8"/>
-                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-                    <Style.Triggers>
-                        <Trigger Property="IsSelected" Value="True">
-                            <Setter Property="Background" Value="$($script:thBgAlt)"/>
-                            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
-                        </Trigger>
-                    </Style.Triggers>
-                </Style>
             </StackPanel.Resources>
             <TextBlock Text="Review folder access" FontSize="21" FontWeight="SemiBold" Foreground="$($script:thFgStrong)"/>
             <TextBlock Name="txtFolder" TextWrapping="Wrap" FontFamily="Consolas" Margin="0,4,0,10"/>
@@ -948,39 +948,248 @@ function Initialize-ScanFolder {
 	return $results
 }
 
+function ConvertTo-ScanSharePath {
+	param([string]$Path)
+
+	# Compare local absolute paths without depending on localized command output.
+	# Do not follow junctions or guess that two differently named paths are equal.
+	if ($Path -notmatch '^[a-zA-Z]:\\') { throw "SMB setup requires an absolute local drive path, not '$Path'." }
+	return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Show-ScanShareConflictDialog {
+	param([string]$ShareName, [string]$ExistingPath, [string]$FolderPath)
+
+	$content = @'
+<StackPanel>
+    <TextBlock Text="Another share name" Margin="0,0,0,4"/>
+    <TextBox Name="txtShareName" AutomationProperties.Name="Another SMB share name"/>
+</StackPanel>
+'@
+	$window = New-ScanDialog -Title 'Share name conflict' -Message "Share '$ShareName' already points to '$ExistingPath', not '$FolderPath'." `
+		-Guidance 'The existing share will not be changed. Choose a different name, or cancel share setup.' `
+		-ContentXaml $content -AcceptText 'Check name' -CancelText 'Cancel share setup' -DefaultCancel -Owner $script:progressWindow
+	$window.FindName('btnAccept').IsEnabled = $false
+	$window.FindName('txtShareName').Add_TextChanged({
+		$dialog = [System.Windows.Window]::GetWindow($this)
+		$dialog.FindName('btnAccept').IsEnabled = -not [string]::IsNullOrWhiteSpace($this.Text)
+	})
+	if ($window.ShowDialog() -eq $true) { return $window.FindName('txtShareName').Text.Trim() }
+}
+
+function Get-ScanShareAccessRows {
+	param([array]$Access, [System.Security.Principal.SecurityIdentifier]$ScanSid)
+
+	$rows = @(foreach ($entry in $Access) {
+		if ([string]::IsNullOrWhiteSpace($entry.AccountName) -or
+			$entry.AccessControlType -notin @('Allow', 'Deny') -or $entry.AccessRight -notin @('Read', 'Change', 'Full')) {
+			throw 'The share has an unsupported permission entry. Review it in Windows before running setup.'
+		}
+		$sid = $null
+		$principal = $entry.AccountName
+		try {
+			$sid = if ($entry.AccountName -match '^S-\d-') {
+				[System.Security.Principal.SecurityIdentifier]::new($entry.AccountName)
+			} else { Resolve-ScanAccountSid $entry.AccountName }
+			$principal = Resolve-ScanPrincipalDisplay $sid
+		}
+		catch [System.Security.Principal.IdentityNotMappedException] {
+			$principal = "Unresolved account ($($entry.AccountName))"
+			Write-Warning "Could not resolve share principal '$($entry.AccountName)'; its access is not assumed to be the scan account."
+		}
+		$isScan = $null -ne $sid -and $sid.Value -eq $ScanSid.Value
+		[pscustomobject]@{
+			Principal = $principal
+			AccountName = $entry.AccountName
+			Type = [string]$entry.AccessControlType
+			Access = [string]$entry.AccessRight
+			IsScan = $isScan
+			IdentityKey = $(if ($sid) { $sid.Value } else { $entry.AccountName })
+			CanRemove = $false
+			Remove = $false
+			Icon = $(if ($entry.AccessControlType -eq 'Deny') { [char]0xE711 } else { [char]0xE73E })
+		}
+	})
+	foreach ($row in $rows) {
+		# Revoke-SmbShareAccess removes every Allow for a principal, not a single
+		# ACE. Count aliases by SID as well as duplicate displayed account names.
+		$allowCount = @($rows | Where-Object { $_.IdentityKey -eq $row.IdentityKey -and $_.Type -eq 'Allow' }).Count
+		$row.CanRemove = $row.Type -eq 'Allow' -and $allowCount -eq 1 -and (-not $row.IsScan -or $row.Access -eq 'Full')
+		$row
+	}
+}
+
+function Show-ScanShareAccessDialog {
+	param([string]$ShareName, [string]$FolderPath, [string]$ScanAccount, [array]$Rows)
+
+	$warningColor = if ($script:useDarkTheme) { '#d7af35' } else { '#875f00' }
+	$content = @"
+<StackPanel>
+    <Border Background="$($script:thBgAlt)" CornerRadius="5" Padding="12" Margin="0,0,0,10">
+        <StackPanel>
+            <TextBlock Text="Scan account access" FontWeight="SemiBold" Foreground="$($script:thFgStrong)"/>
+            <TextBlock Name="txtScanAccess" TextWrapping="Wrap" Margin="0,5,0,0"/>
+            <TextBlock Text="Change permits SMB read/write/delete operations; NTFS still limits actual file access. No share is deleted or recreated." TextWrapping="Wrap" Margin="0,5,0,0"/>
+        </StackPanel>
+    </Border>
+    <TextBlock Name="txtAccessWarning" TextWrapping="Wrap" Foreground="$warningColor" FontWeight="SemiBold" Margin="0,0,0,10"/>
+    <ListView Name="lstShareAccess" Height="200" Background="$($script:thBg)" Foreground="$($script:thFgStrong)" BorderBrush="$($script:thBorder)" AutomationProperties.Name="Existing SMB share permissions">
+        <ListView.Resources>
+            <Style TargetType="TextBlock">
+                <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            </Style>
+        </ListView.Resources>
+        <ListView.ItemContainerStyle>
+            <Style TargetType="ListViewItem" BasedOn="{StaticResource {x:Type ListViewItem}}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                <Setter Property="ToolTip" Value="{Binding AccountName}"/>
+            </Style>
+        </ListView.ItemContainerStyle>
+        <ListView.View>
+            <GridView AllowsColumnReorder="False">
+                <GridViewColumn Header="Remove" Width="70">
+                    <GridViewColumn.CellTemplate>
+                        <DataTemplate>
+                            <CheckBox IsChecked="{Binding Remove, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Remove this Allow grant">
+                                <CheckBox.Style>
+                                    <Style TargetType="CheckBox">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers><DataTrigger Binding="{Binding CanRemove}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
+                                    </Style>
+                                </CheckBox.Style>
+                            </CheckBox>
+                        </DataTemplate>
+                    </GridViewColumn.CellTemplate>
+                </GridViewColumn>
+                <GridViewColumn Header="" Width="30">
+                    <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Icon}" FontFamily="Segoe MDL2 Assets"/></DataTemplate></GridViewColumn.CellTemplate>
+                </GridViewColumn>
+                <GridViewColumn Header="Account" Width="300" DisplayMemberBinding="{Binding Principal}"/>
+                <GridViewColumn Header="Type" Width="80" DisplayMemberBinding="{Binding Type}"/>
+                <GridViewColumn Header="Share access" Width="110" DisplayMemberBinding="{Binding Access}"/>
+            </GridView>
+        </ListView.View>
+    </ListView>
+    <TextBlock Text="All removals start unchecked. Remove only Allow grants you recognize and no longer need. Deny entries are never removed. Selecting the scan account's Full grant replaces it with Change; otherwise Full stays." TextWrapping="Wrap" Margin="0,10,0,0"/>
+</StackPanel>
+"@
+	$window = New-ScanDialog -Title 'Review SMB share access' -Message "Existing share: $ShareName`nFolder: $FolderPath" `
+		-ContentXaml $content -AcceptText 'Apply share access' -CancelText 'Cancel share setup' -DefaultCancel -Width 750 -Owner $script:progressWindow
+	$window.FindName('txtScanAccess').Text = "$ScanAccount will receive Change if it does not already have Change or Full."
+	$otherAllows = @($Rows | Where-Object { $_.Type -eq 'Allow' -and -not $_.IsScan }).Count
+	$scanFull = @($Rows | Where-Object { $_.Type -eq 'Allow' -and $_.IsScan -and $_.Access -eq 'Full' }).Count
+	$denies = @($Rows | Where-Object { $_.Type -eq 'Deny' }).Count
+	$summary = "Other-account Allow grants: $otherAllows; scan Full grants: $scanFull; Deny entries: $denies."
+	$window.FindName('txtAccessWarning').Text = "$summary`nExisting grants can permit broader access, including through groups. Unselected entries stay. Deny entries may block scanning. This is not an effective-access calculation."
+	Write-Warning "Reviewing share '$ShareName': $summary Unselected grants and all Deny entries will remain."
+	$window.FindName('lstShareAccess').ItemsSource = $Rows
+	if ($window.ShowDialog() -eq $true) {
+		return @{ RemoveAccounts = @($Rows | Where-Object { $_.CanRemove -and $_.Remove } | ForEach-Object { $_.AccountName }) }
+	}
+}
+
+function Get-ScanShareAccessSnapshot {
+	param([array]$Access)
+
+	# A stable structured snapshot detects path/ACL edits while the review is
+	# open. Windows does not provide an atomic compare-and-swap share ACL API.
+	return ConvertTo-Json -Compress -InputObject @($Access | Sort-Object AccountName, AccessControlType, AccessRight |
+		Select-Object AccountName, AccessControlType, AccessRight)
+}
+
 function Initialize-ScanShare {
 	param(
 		[string]$ShareName,
 		[string]$FolderPath,
 		[string]$ScanUser
 	)
+	$changes = @()
 	try {
-		if ($script:hasSmbShareCmdlets) {
-			if (-not (Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -eq $ShareName })) {
-				New-SmbShare -Name $ShareName -Path $FolderPath -FullAccess $ScanUser -ErrorAction Stop | Out-Null
-				return @{ Status = 'Success'; Message = "Created SMB share '$ShareName'"; Error = $null }
+		$targetPath = ConvertTo-ScanSharePath $FolderPath
+		if (-not (Test-Path -LiteralPath $FolderPath -PathType Container -ErrorAction Stop)) { throw "Selected folder '$FolderPath' does not exist." }
+		$scanAccount = "$env:COMPUTERNAME\$ScanUser"
+		$scanSid = Resolve-ScanAccountSid $scanAccount
+		while ($true) {
+			if ([string]::IsNullOrWhiteSpace($ShareName) -or $ShareName.Length -gt 80 -or
+				$ShareName -match '["/\\\[\]:;|=,+*?<>]' -or $ShareName.EndsWith('$') -or $ShareName -ne $ShareName.Trim()) {
+				throw 'Choose a nonempty ordinary share name of at most 80 characters without reserved characters or a trailing $.'
 			}
-			else {
-				Grant-SmbShareAccess -Name $ShareName -AccountName $ScanUser -AccessRight Full -Force -ErrorAction Stop | Out-Null
-				return @{ Status = 'Success'; Message = "Updated SMB share permissions for '$ShareName'"; Error = $null }
+			$existing = @(if ($script:hasSmbShareCmdlets) {
+				@(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -eq $ShareName })
+			} else {
+				# Enumerating structured WMI results distinguishes "absent" from a
+				# lookup failure without parsing localized net share output.
+				@(Get-CimInstance -ClassName Win32_Share -ErrorAction Stop | Where-Object { $_.Name -eq $ShareName })
+			})
+			if ($existing.Count -gt 1) { throw "Multiple scoped shares named '$ShareName' exist. Configure them in Windows; Scans will not guess a scope." }
+			if ($existing.Count -eq 0) { break }
+			if ($existing[0].Special -or [string]::IsNullOrWhiteSpace($existing[0].Path)) { throw "Share '$ShareName' is a special share and will not be modified." }
+			if ((ConvertTo-ScanSharePath $existing[0].Path) -eq $targetPath) { break }
+			Write-Warning "Share '$ShareName' points to '$($existing[0].Path)', not '$FolderPath'. No changes made to that share."
+			$replacementName = Show-ScanShareConflictDialog -ShareName $ShareName -ExistingPath $existing[0].Path -FolderPath $FolderPath
+			if ([string]::IsNullOrWhiteSpace($replacementName)) { throw [System.OperationCanceledException]::new('Share setup canceled at a path conflict. No share changes were made.') }
+			$ShareName = $replacementName
+		}
+		if ($existing.Count -eq 0) {
+			if ($script:hasSmbShareCmdlets) {
+				New-SmbShare -Name $ShareName -Path $FolderPath -ChangeAccess $scanAccount -ErrorAction Stop | Out-Null
+			} else {
+				# Win32_Share.Create is create-only (duplicate names fail), unlike
+				# invoking a command that might also edit an existing share.
+				$sidBytes = [byte[]]::new($scanSid.BinaryLength)
+				$scanSid.GetBinaryForm($sidBytes, 0)
+				$trustee = New-CimInstance -ClassName Win32_Trustee -ClientOnly -Property @{ SID = $sidBytes } -ErrorAction Stop
+				$ace = New-CimInstance -ClassName Win32_ACE -ClientOnly -Property @{
+					AccessMask = [uint32]1245631; AceFlags = [uint32]0; AceType = [uint32]0; Trustee = $trustee
+				} -ErrorAction Stop
+				$descriptor = New-CimInstance -ClassName Win32_SecurityDescriptor -ClientOnly -Property @{
+					ControlFlags = [uint32]4; DACL = [Microsoft.Management.Infrastructure.CimInstance[]]@($ace)
+				} -ErrorAction Stop
+				$created = Invoke-CimMethod -ClassName Win32_Share -MethodName Create -Arguments @{
+					Name = $ShareName; Path = $FolderPath; Type = [uint32]0; Access = $descriptor
+				} -ErrorAction Stop
+				if ($created.ReturnValue -ne 0) { throw "Win32_Share.Create failed (return code $($created.ReturnValue)). No existing share was updated." }
+			}
+			Write-Verbose "Created SMB share '$ShareName' at '$FolderPath' with Change for '$scanAccount'."
+			return @{ Status = 'Success'; Message = "Created SMB share '$ShareName' at '$FolderPath' with Change for '$scanAccount'"; Error = $null; ShareName = $ShareName }
+		}
+		if (-not $script:hasSmbShareCmdlets) {
+			throw "Share '$ShareName' already exists. Without SMB cmdlets, Scans cannot safely review/edit its ACL. Configure it in Windows or rerun on a host with SMB cmdlets; no share changes were made."
+		}
+		if ($existing[0].ScopeName -and $existing[0].ScopeName -ne '*') { throw "Share '$ShareName' is scoped. Configure it in Windows; Scans only edits ordinary local shares." }
+		$access = @(Get-SmbShareAccess -Name $ShareName -ErrorAction Stop)
+		if ($access.Count -eq 0) { throw 'No readable share permission entries were returned; refusing to edit an unreviewable ACL.' }
+		$rows = @(Get-ScanShareAccessRows -Access $access -ScanSid $scanSid)
+		$choice = Show-ScanShareAccessDialog -ShareName $ShareName -FolderPath $FolderPath -ScanAccount $scanAccount -Rows $rows
+		if ($null -eq $choice) { throw [System.OperationCanceledException]::new('Share access review canceled. No share changes were made.') }
+		$removeAccounts = @($choice.RemoveAccounts | Select-Object -Unique)
+		foreach ($account in $removeAccounts) {
+			if (@($rows | Where-Object { $_.CanRemove -and $_.AccountName -eq $account }).Count -ne 1) {
+				throw "Unreviewed or ambiguous removal requested for '$account'; no changes made."
 			}
 		}
-		else {
-			$existing = net share $ShareName 2>&1
-			if ($LASTEXITCODE -ne 0) {
-				$shareOutput = net share "$ShareName=$FolderPath" "/grant:$ScanUser,FULL" 2>&1
-				if ($LASTEXITCODE -ne 0) { throw "net share failed (exit code $LASTEXITCODE). $($shareOutput | Out-String)" }
-				return @{ Status = 'Success'; Message = "Created SMB share '$ShareName' (net share)"; Error = $null }
-			}
-			else {
-				$shareOutput = net share "$ShareName=$FolderPath" "/grant:$ScanUser,FULL" /yes 2>&1
-				if ($LASTEXITCODE -ne 0) { throw "net share failed (exit code $LASTEXITCODE). $($shareOutput | Out-String)" }
-				return @{ Status = 'Success'; Message = "Updated SMB share '$ShareName' (net share)"; Error = $null }
-			}
+		$current = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -eq $ShareName })
+		if ($current.Count -ne 1 -or $current[0].Special -or $current[0].ScopeName -ne $existing[0].ScopeName -or
+			(ConvertTo-ScanSharePath $current[0].Path) -ne $targetPath -or
+			(Get-ScanShareAccessSnapshot @(Get-SmbShareAccess -Name $ShareName -ErrorAction Stop)) -cne (Get-ScanShareAccessSnapshot $access)) {
+			throw 'The share path, scope, or permissions changed during review. No changes were made by Scans; rerun setup to review the current state.'
 		}
+		foreach ($account in $removeAccounts) {
+			Revoke-SmbShareAccess -Name $ShareName -AccountName $account -Force -ErrorAction Stop | Out-Null
+			$changes += "removed Allow for '$account'"
+			Write-Warning "Removed explicitly reviewed SMB Allow grant for '$account' on '$ShareName'."
+		}
+		$hasAccess = @($rows | Where-Object { $_.IsScan -and $_.Type -eq 'Allow' -and $_.Access -in @('Change', 'Full') -and $_.AccountName -notin $removeAccounts }).Count -gt 0
+		if (-not $hasAccess) {
+			Grant-SmbShareAccess -Name $ShareName -AccountName $scanAccount -AccessRight Change -Force -ErrorAction Stop | Out-Null
+			$changes += "granted Change to '$scanAccount'"
+			Write-Verbose "Granted SMB Change to '$scanAccount' on '$ShareName'."
+		}
+		Write-Warning "Share '$ShareName': unselected grants and all Deny entries were preserved. Group membership and NTFS permissions affect effective access; test a real scan."
+		return @{ Status = 'Success'; Message = "Reviewed SMB share '$ShareName' at '$FolderPath'; scan Change/Full Allow present; unselected permissions preserved. Check effective access and test scanning."; Error = $null; ShareName = $ShareName }
 	}
 	catch {
-		return @{ Status = 'Failed'; Message = "Failed to configure SMB share '$ShareName'"; Error = $_.Exception.Message }
+		$partial = if ($changes.Count) { " Partial updates already applied: $($changes -join '; '). No rollback attempted; inspect the share before retrying." } else { '' }
+		return @{ Status = 'Failed'; Message = "Failed to configure SMB share '$ShareName'"; Error = "$($_.Exception.Message)$partial" }
 	}
 }
 
@@ -1464,6 +1673,7 @@ else {
 
 	if ($setShare -eq $true -and $scanUserConfigured -and $scanFolderConfigured) {
 		$shareResult = Initialize-ScanShare -ShareName $shareName -FolderPath $folderPath -ScanUser $scanUser
+		if ($shareResult.Status -eq 'Success') { $script:shareName = $shareResult.ShareName }
 		Show-StepResult $shareResult
 	}
 
