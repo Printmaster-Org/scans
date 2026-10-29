@@ -51,8 +51,8 @@ $($script:themeResources)
         <DockPanel Grid.Row="1" Margin="0,12,0,0" LastChildFill="False">
             <TextBlock Name="txtProvider" Text="Provided by PrintMaster" FontSize="11" VerticalAlignment="Center"/>
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                <Button Name="btnAccept" MinWidth="85" Height="28" IsDefault="True" Margin="8,0,0,0"/>
-                <Button Name="btnCancel" MinWidth="85" Height="28" IsCancel="True" Margin="8,0,0,0"/>
+                <Button Name="btnCancel" Style="{StaticResource SecondaryButton}" MinWidth="85" Height="32" IsCancel="True" Margin="8,0,0,0"/>
+                <Button Name="btnAccept" MinWidth="110" Height="32" FontWeight="SemiBold" IsDefault="True" Margin="8,0,0,0"/>
             </StackPanel>
         </DockPanel>
     </Grid>
@@ -165,19 +165,19 @@ $script:themeResources = @"
         <Style TargetType="Button">
             <Setter Property="Background" Value="$($script:thAccent)"/>
             <Setter Property="Foreground" Value="$($script:thBtnText)"/>
-            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="Padding" Value="10,3"/>
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Border Background="{TemplateBinding Background}" CornerRadius="3"
-                                Padding="6,3" SnapsToDevicePixels="True">
+                                BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" Value="$($script:thAccentHi)"/>
-                            </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.45"/>
                             </Trigger>
@@ -185,6 +185,27 @@ $script:themeResources = @"
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="$($script:thAccentHi)"/>
+                </Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter Property="BorderBrush" Value="$($script:thFgStrong)"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="SecondaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            <Setter Property="BorderBrush" Value="$($script:thBorder)"/>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="$($script:thBgAlt)"/>
+                </Trigger>
+                <Trigger Property="IsKeyboardFocused" Value="True">
+                    <Setter Property="BorderBrush" Value="$($script:thFgStrong)"/>
+                </Trigger>
+            </Style.Triggers>
         </Style>
         <Style TargetType="TextBox">
             <Setter Property="Background" Value="$($script:thBgAlt)"/>
@@ -225,12 +246,36 @@ $script:themeResources = @"
         </Style>
         <Style TargetType="ListViewItem">
             <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding" Value="0,8"/>
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListViewItem" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                        <Border Name="RowChrome" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+                            <GridViewRowPresenter Content="{TemplateBinding Content}"
+                                Columns="{Binding View.Columns, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}"
+                                SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
             <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="$($script:thBgAlt)"/>
+                    <Setter Property="BorderBrush" Value="$($script:thBorder)"/>
+                </Trigger>
                 <Trigger Property="IsSelected" Value="True">
                     <Setter Property="Background" Value="$($script:thBgAlt)"/>
-                    <Setter Property="Foreground" Value="$($script:thFgStrong)"/>
+                    <Setter Property="BorderBrush" Value="$($script:thAccent)"/>
+                </Trigger>
+                <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                    <Setter Property="BorderBrush" Value="$($script:thAccentHi)"/>
                 </Trigger>
             </Style.Triggers>
         </Style>
@@ -819,7 +864,7 @@ function Show-ScanFolderAccessDialog {
         </StackPanel>
 "@
 	$window = New-ScanDialog -Title 'Folder Access' -ContentXaml $folderAccessContent -Width 900 `
-		-AcceptText 'Apply permissions' -CancelText 'Cancel folder setup' -Owner $script:progressWindow
+		-AcceptText 'Apply permissions' -CancelText 'Cancel folder setup' -DefaultCancel -Owner $script:progressWindow
 	$window.FindName('txtFolder').Text = $FolderPath
 	$window.FindName('txtRecipient').Text = $DesktopUser
 	$identityText = "Desktop: $DesktopUser  |  Running as: $ElevatedUser"

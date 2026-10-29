@@ -1270,6 +1270,50 @@ Describe 'Shared themed dialogs' {
 		}
 	}
 
+	It 'puts quiet Cancel before the emphasized rightmost approval action in both themes' {
+		$palette = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.IfStatementAst] -and
+			$node.Clauses[0].Item1.Extent.Text -eq '$script:useDarkTheme'
+		}, $true)
+		$resources = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+			$node.Left.Extent.Text -eq '$script:themeResources'
+		}, $true)
+		foreach ($dark in @($true, $false)) {
+			$script:useDarkTheme = $dark
+			. ([scriptblock]::Create($palette.Extent.Text))
+			. ([scriptblock]::Create($resources.Extent.Text))
+			$window = New-ScanDialog -Title 'Footer hierarchy' -DefaultCancel
+			try {
+				$cancel = $window.FindName('btnCancel')
+				$accept = $window.FindName('btnAccept')
+				$cancel.Parent.Children[0] | Should Be $cancel
+				$cancel.Parent.Children[1] | Should Be $accept
+				$cancel.Background.Color.A | Should Be 0
+				$cancel.Foreground.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thFgStrong))
+				$cancel.BorderThickness.Left | Should Be 1
+				$accept.Background.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thAccent))
+				$accept.FontWeight | Should Be ([System.Windows.FontWeights]::SemiBold)
+				$cancel.IsDefault | Should Be $true
+				$cancel.IsCancel | Should Be $true
+				$accept.IsDefault | Should Be $false
+				$cancel.ApplyTemplate() | Out-Null
+				$mouseKey = [System.Windows.UIElement].GetField('IsMouseOverPropertyKey', [Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+				$cancel.SetValue($mouseKey, $true)
+				$cancel.Background.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thBgAlt))
+				$cancel.Foreground.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thFgStrong))
+				$window.Content.Measure([System.Windows.Size]::new(900, 780))
+				$window.Content.Arrange([System.Windows.Rect]::new(0, 0, 900, 200))
+				$window.Content.UpdateLayout()
+				($accept.ActualWidth -gt 0) | Should Be $true
+				$cancel.TranslatePoint([System.Windows.Point]::new(0, 0), $window.Content).X | Should BeLessThan $accept.TranslatePoint([System.Windows.Point]::new(0, 0), $window.Content).X
+			}
+			finally { $window.Close() }
+		}
+	}
+
 	It 'centers on an owner when supplied and on screen for startup failures' {
 		$ownerWindow = [System.Windows.Window]::new()
 		[System.Windows.Interop.WindowInteropHelper]::new($ownerWindow).EnsureHandle() | Out-Null
@@ -1423,6 +1467,8 @@ Describe 'Folder access review dialog' {
 			$window.FindName('chkEveryone').IsChecked | Should Be $false
 			$window.FindName('txtPolicy').Text | Should Match 'inheritance will be disabled'
 			$window.FindName('btnAccept').IsEnabled | Should Be $true
+			$window.FindName('btnAccept').IsDefault | Should Be $false
+			$window.FindName('btnCancel').IsDefault | Should Be $true
 		}
 		$result = Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'DOMAIN\recipient' -ElevatedUser 'PC\admin'
 		$result.Recipient | Should Be 'DOMAIN\recipient'
@@ -1563,6 +1609,126 @@ Describe 'Folder access review dialog' {
 		$script:tableBindingError | Should BeNullOrEmpty
 		$result.RemoveRules.Count | Should Be 1
 		$result.RemoveRules[0].IdentityReference.Value | Should Be 'S-1-1-0'
+	}
+}
+
+Describe 'Permission table interaction rendering' {
+	BeforeEach {
+		Add-Type -AssemblyName PresentationFramework
+		$script:progressWindow = $null
+		$script:rowRenderError = $null
+		Mock Resolve-ScanPrincipalDisplay { 'TEST\recipient' }
+		Mock Set-WindowTheme {
+			$window.WindowStartupLocation = 'Manual'
+			$window.Left = -32000
+			$window.Top = -32000
+			$window.ShowActivated = $false
+			$window.Add_ContentRendered({
+				try {
+					$table = $this.FindName($script:interactionTable)
+					$table.UpdateLayout()
+					$row = $table.ItemContainerGenerator.ContainerFromIndex(0)
+					$row | Should Not BeNullOrEmpty
+					$chrome = $row.Template.FindName('RowChrome', $row)
+					$chrome | Should Not BeNullOrEmpty
+					([Math]::Abs($chrome.ActualWidth - $row.ActualWidth) -lt 1) | Should Be $true
+					($row.ActualWidth -ge $table.ActualWidth - 40) | Should Be $true
+					$mouseKey = [System.Windows.UIElement].GetField('IsMouseOverPropertyKey', [Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+					$focusKey = [System.Windows.UIElement].GetField('IsKeyboardFocusWithinPropertyKey', [Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+					$activeKey = [System.Windows.Controls.Primitives.Selector].GetField('IsSelectionActivePropertyKey', [Reflection.BindingFlags]'Static,NonPublic').GetValue($null)
+					$states = @(
+						@{ Hover = $false; Selected = $false; Active = $false; Focus = $false }
+						@{ Hover = $true; Selected = $false; Active = $false; Focus = $false }
+						@{ Hover = $false; Selected = $true; Active = $true; Focus = $false }
+						@{ Hover = $true; Selected = $true; Active = $true; Focus = $false }
+						@{ Hover = $false; Selected = $true; Active = $false; Focus = $false }
+						@{ Hover = $false; Selected = $true; Active = $true; Focus = $true }
+					)
+					foreach ($state in $states) {
+						# Drive WPF's real trigger properties without moving the user's
+						# mouse or stealing desktop focus during off-screen tests.
+						$row.SetValue($mouseKey, $state.Hover)
+						$row.IsSelected = $state.Selected
+						$row.SetValue($activeKey, $state.Active)
+						$row.SetValue($focusKey, $state.Focus)
+						$table.UpdateLayout()
+						$background = if ($state.Hover -or $state.Selected) { $script:thBgAlt } else { $script:thBg }
+						$expectedBorder = if ($state.Focus) { $script:thAccentHi } elseif ($state.Selected) { $script:thAccent } elseif ($state.Hover) { $script:thBorder } else { 'Transparent' }
+						$chrome.BorderBrush.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($expectedBorder))
+						$row.Foreground.Color | Should Be ([System.Windows.Media.ColorConverter]::ConvertFromString($script:thFgStrong))
+
+						$visual = [System.Windows.Media.DrawingVisual]::new()
+						$context = $visual.RenderOpen()
+						$rect = [System.Windows.Rect]::new(0, 0, $row.ActualWidth, $row.ActualHeight)
+						$context.DrawRectangle($table.Background, $null, $rect)
+						$context.DrawRectangle([System.Windows.Media.VisualBrush]::new($row), $null, $rect)
+						$context.Close()
+						$bitmap = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(
+							[int][Math]::Ceiling($row.ActualWidth), [int][Math]::Ceiling($row.ActualHeight),
+							96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+						$bitmap.Render($visual)
+						$expected = [System.Windows.Media.ColorConverter]::ConvertFromString($background)
+						# Sample the fill across the row below its text, not just
+						# the Background property that the native template ignored.
+						foreach ($x in @(3, [int]($row.ActualWidth / 2), ([int]$row.ActualWidth - 4))) {
+							$pixel = [byte[]]::new(4)
+							$bitmap.CopyPixels([System.Windows.Int32Rect]::new($x, [int]$row.ActualHeight - 4, 1, 1), $pixel, 4, 0)
+							$pixel[0] | Should Be $expected.B
+							$pixel[1] | Should Be $expected.G
+							$pixel[2] | Should Be $expected.R
+							$pixel[3] | Should Be 255
+						}
+						$luminance = foreach ($color in @($row.Foreground.Color, $expected)) {
+							$channels = foreach ($channel in @($color.R, $color.G, $color.B)) {
+								$value = $channel / 255.0
+								if ($value -le 0.04045) { $value / 12.92 } else { [Math]::Pow(($value + 0.055) / 1.055, 2.4) }
+							}
+							0.2126 * $channels[0] + 0.7152 * $channels[1] + 0.0722 * $channels[2]
+						}
+						$ratio = ([Math]::Max($luminance[0], $luminance[1]) + 0.05) / ([Math]::Min($luminance[0], $luminance[1]) + 0.05)
+						($ratio -ge 4.5) | Should Be $true
+					}
+				}
+				catch { $script:rowRenderError = $_ | Out-String }
+				finally { $this.DialogResult = $false }
+			})
+		}
+	}
+
+	It 'renders full-width readable interaction states for <Table> in dark=<Dark>' -TestCases @(
+		@{ Table = 'folder'; Dark = $true }
+		@{ Table = 'folder'; Dark = $false }
+		@{ Table = 'share'; Dark = $true }
+		@{ Table = 'share'; Dark = $false }
+	) {
+		param($Table, $Dark)
+		$script:useDarkTheme = $Dark
+		$palette = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.IfStatementAst] -and
+			$node.Clauses[0].Item1.Extent.Text -eq '$script:useDarkTheme'
+		}, $true)
+		. ([scriptblock]::Create($palette.Extent.Text))
+		$resources = $ast.Find({
+			param($node)
+			$node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+			$node.Left.Extent.Text -eq '$script:themeResources'
+		}, $true)
+		. ([scriptblock]::Create($resources.Extent.Text))
+		if ($Table -eq 'folder') {
+			$script:interactionTable = 'lstExistingRules'
+			$acl = [System.Security.AccessControl.DirectorySecurity]::new()
+			$acl.SetSecurityDescriptorSddlForm('D:AI(A;OICI;FA;;;SY)')
+			Show-ScanFolderAccessDialog -FolderPath 'C:\scans' -DesktopUser 'TEST\recipient' -ElevatedUser 'TEST\recipient' -Acl $acl | Out-Null
+		} else {
+			$script:interactionTable = 'lstShareAccess'
+			$rows = @([pscustomobject]@{
+				Principal = 'TEST\recipient'; AccountName = 'TEST\recipient'; Type = 'Allow'
+				Access = 'Change'; IsScan = $true; CanRemove = $false; Remove = $false; Icon = [char]0xE73E
+			})
+			Show-ScanShareAccessDialog -ShareName scans -FolderPath 'C:\scans' -ScanAccount 'TEST\recipient' -Rows $rows | Out-Null
+		}
+		$script:rowRenderError | Should BeNullOrEmpty
 	}
 }
 
