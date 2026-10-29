@@ -203,9 +203,9 @@ Startup failures stop setup with an error dialog. Failed setup steps no longer i
 
 ### Desktop shortcut fails
 
-Versions v3.0.0 and v3.0.1 can report **Failed to create desktop shortcut: Value does not fall within the expected range** when launched through the release loader. The folder and share can still work; a shortcut failure is optional. Until a release containing the fix is published, create a shortcut to your configured scans folder in File Explorer. After upgrading, rerun with only **Add a desktop shortcut to the folder** selected under **Advanced options** to avoid changing the account password or folder/share permissions again.
+Versions v3.0.0 and v3.0.1 can report **Failed to create desktop shortcut: Value does not fall within the expected range** when launched through the release loader. The folder and share can still work; a shortcut failure is optional. Fixed in v3.0.2: rerun with only **Add a desktop shortcut to the folder** selected under **Advanced options** to avoid changing the account password or folder/share permissions again.
 
-The development version also assigns each setup window its own Windows taskbar identity, keeping the printer logo separate from PowerShell's taskbar grouping. These utility fixes are not delivered by refreshing the loader alone.
+Since v3.0.2, each setup window also has its own Windows taskbar identity, so the taskbar shows the printer logo instead of grouping it with PowerShell.
 
 ## Development and deployment
 
