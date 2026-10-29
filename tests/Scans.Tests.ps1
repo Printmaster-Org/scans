@@ -1472,9 +1472,35 @@ Describe 'Desktop shortcut setup' {
 
 	It 'reports COM activation failure' {
 		Mock New-Object { throw 'COM unavailable' } -ParameterFilter { $ComObject -eq 'WScript.Shell' }
-		$result = Initialize-DesktopShortcut -FolderPath 'C:\scans'
+		$result = Initialize-DesktopShortcut -FolderPath 'C:\scans' -IconPath 'C:\scans.ico'
 		$result.Status | Should Be 'Failed'
 		$result.Error | Should Match 'COM unavailable'
+	}
+
+	It 'reports a missing icon path before invoking Windows shortcut creation' {
+		Mock New-Object { throw 'Should not create a COM object' } -ParameterFilter { $ComObject -eq 'WScript.Shell' }
+		$result = Initialize-DesktopShortcut -FolderPath 'C:\scans'
+		$result.Status | Should Be 'Failed'
+		$result.Error | Should Match 'shortcut icon path is missing'
+		Assert-MockCalled New-Object -Times 0 -Exactly -Scope It -ParameterFilter { $ComObject -eq 'WScript.Shell' }
+	}
+
+	It 'keeps the production icon path visible to setup in the loader child scope' {
+		$assignment = $ast.EndBlock.Statements | Where-Object {
+			$_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+			($_.Left.Extent.Text -replace '^\$(script:)?', '') -eq 'iconPath'
+		}
+		$assignment | Should Not BeNullOrEmpty
+		$hostShell = [powershell]::Create()
+		try {
+			$launch = '& {' + $assignment.Extent.Text +
+				'; function Get-TestShortcutIcon { $script:iconPath }; Get-TestShortcutIcon }'
+			$value = @($hostShell.AddScript($launch).Invoke())
+			$hostShell.HadErrors | Should Be $false
+			$value.Count | Should Be 1
+			$value[0] | Should Be 'C:\ProgramData\scans.ico'
+		}
+		finally { $hostShell.Dispose() }
 	}
 }
 
@@ -1694,7 +1720,7 @@ Describe 'Shared themed dialogs' {
 		$source.IndexOf('$script:themeResources =') | Should BeLessThan $preflight
 		$source.IndexOf('function Set-WindowTheme') | Should BeLessThan $preflight
 		$source.IndexOf('function New-PrintMasterIcon') | Should BeLessThan $preflight
-		$source.IndexOf('$iconPath =') | Should BeGreaterThan $preflight
+		$source.IndexOf('$script:iconPath =') | Should BeGreaterThan $preflight
 	}
 }
 
