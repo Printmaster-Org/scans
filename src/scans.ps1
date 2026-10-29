@@ -427,6 +427,8 @@ $setPermissions = $true
 $setShare = $true
 $createShortcut = $true
 $checkNetworkSettings = $true
+# Network Discovery is not needed for SMB scan-to-folder; enable only on request.
+$enableNetworkDiscovery = $false
 
 function New-RandomPassword {
 	param([int]$Length = 10)
@@ -1259,8 +1261,52 @@ function Initialize-DesktopShortcut {
 	}
 }
 
+<#
+.SYNOPSIS
+Enables one inbound Windows Firewall rule group and returns a step result.
+.DESCRIPTION
+Uses NetSecurity cmdlets scoped to the active profile when available; otherwise
+falls back to netsh, which enables the group for every profile. Already-enabled
+groups are reported without being rewritten.
+#>
+function Enable-ScanFirewallGroup {
+	param(
+		[Parameter(Mandatory)][string]$Group,
+		[Parameter(Mandatory)][string]$Label,
+		[string]$FirewallProfile
+	)
+	if ($script:hasNetSecurity) {
+		$enabled = @(Get-NetFirewallRule -DisplayGroup $Group -Direction Inbound | Where-Object { $_.Enabled -eq 'True' -and $_.Profile -eq $FirewallProfile })
+		if ($enabled.Count -gt 0) {
+			Write-Verbose "Firewall group '$Group' already enabled for profile '$FirewallProfile'."
+			return @{ Status = 'Success'; Message = "$Label is already enabled ($FirewallProfile profile)."; Error = $null }
+		}
+		try {
+			Set-NetFirewallRule -DisplayGroup $Group -Direction Inbound -Enabled True -Profile $FirewallProfile -ErrorAction Stop
+			Write-Verbose "Enabled firewall group '$Group' for profile '$FirewallProfile'."
+			return @{ Status = 'Success'; Message = "$Label has been enabled ($FirewallProfile profile)."; Error = $null }
+		}
+		catch {
+			return @{ Status = 'Failed'; Message = "Failed to enable $Label."; Error = $_.Exception.Message }
+		}
+	}
+	try {
+		$output = netsh advfirewall firewall set rule group="$Group" new enable=Yes 2>&1
+		if ($LASTEXITCODE -ne 0) { throw "netsh failed (exit code $LASTEXITCODE). $($output | Out-String)" }
+		Write-Verbose "Enabled firewall group '$Group' with netsh."
+		return @{ Status = 'Success'; Message = "$Label has been enabled (netsh)."; Error = $null }
+	}
+	catch {
+		return @{ Status = 'Failed'; Message = "Failed to enable $Label."; Error = $_.Exception.Message }
+	}
+}
+
 function Set-NetworkConfiguration {
-	param([bool]$DomainJoined)
+	param(
+		[bool]$DomainJoined,
+		# Opt-in: only printers that browse for the PC need Network Discovery.
+		[bool]$EnableDiscovery = $false
+	)
 	$results = @()
 
 	if ($script:hasNetConnection) {
@@ -1303,58 +1349,24 @@ function Set-NetworkConfiguration {
 		}
 	}
 
-	# File and Printer Sharing
+	$firewallProfile = $null
 	if ($script:hasNetSecurity) {
 		$networkCategory = (Get-NetConnectionProfile | Select-Object -First 1).NetworkCategory
 		# Map DomainAuthenticated to Domain for firewall cmdlets
 		$firewallProfile = if ($networkCategory -eq 'DomainAuthenticated') { 'Domain' } else { $networkCategory.ToString() }
-		$sharingEnabled = Get-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Direction Inbound | Where-Object { $_.Enabled -eq 'True' -and $_.Profile -eq $firewallProfile }
-		if ($sharingEnabled.count -eq 0) {
-			try {
-				Set-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Direction Inbound -Enabled True -Profile $firewallProfile -ErrorAction Stop
-				$results += @{ Status = 'Success'; Message = 'Network file and printer sharing has been enabled.'; Error = $null }
-			}
-			catch {
-				$results += @{ Status = 'Failed'; Message = 'Failed to enable Network File and Printer Sharing.'; Error = $_.Exception.Message }
-			}
-		}
-		else {
-			$results += @{ Status = 'Success'; Message = 'Network File and Printer Sharing is already enabled.'; Error = $null }
-		}
+	}
 
-		# Network Discovery
-		$discoveryEnabled = Get-NetFirewallRule -DisplayGroup "Network Discovery" -Direction Inbound | Where-Object { $_.Enabled -eq 'True' -and $_.Profile -eq $firewallProfile }
-		if ($discoveryEnabled.count -eq 0) {
-			try {
-				Set-NetFirewallRule -DisplayGroup "Network Discovery" -Direction Inbound -Enabled True -Profile $firewallProfile -ErrorAction Stop
-				$results += @{ Status = 'Success'; Message = 'Network Discovery has been enabled.'; Error = $null }
-			}
-			catch {
-				$results += @{ Status = 'Failed'; Message = 'Failed to Enable Network Discovery.'; Error = $_.Exception.Message }
-			}
-		}
-		else {
-			$results += @{ Status = 'Success'; Message = 'Network Discovery is already enabled.'; Error = $null }
-		}
+	# SMB scanning needs only File and Printer Sharing (TCP 445, plus NetBIOS
+	# name/session ports for older devices). Network Discovery is opt-in: it only
+	# helps printers that browse for the PC instead of using a typed path.
+	$results += Enable-ScanFirewallGroup -Group 'File and Printer Sharing' -Label 'File and Printer Sharing' -FirewallProfile $firewallProfile
+	if ($EnableDiscovery) {
+		$results += Enable-ScanFirewallGroup -Group 'Network Discovery' -Label 'Network Discovery' -FirewallProfile $firewallProfile
 	}
 	else {
-		# Legacy path: netsh advfirewall (Win 7)
-		try {
-			$networkOutput = netsh advfirewall firewall set rule group="File and Printer Sharing" new enable=Yes 2>&1
-			if ($LASTEXITCODE -ne 0) { throw "netsh failed (exit code $LASTEXITCODE). $($networkOutput | Out-String)" }
-			$results += @{ Status = 'Success'; Message = 'Network file and printer sharing has been enabled (netsh).'; Error = $null }
-		}
-		catch {
-			$results += @{ Status = 'Failed'; Message = 'Failed to enable Network File and Printer Sharing.'; Error = $_.Exception.Message }
-		}
-		try {
-			$networkOutput = netsh advfirewall firewall set rule group="Network Discovery" new enable=Yes 2>&1
-			if ($LASTEXITCODE -ne 0) { throw "netsh failed (exit code $LASTEXITCODE). $($networkOutput | Out-String)" }
-			$results += @{ Status = 'Success'; Message = 'Network Discovery has been enabled (netsh).'; Error = $null }
-		}
-		catch {
-			$results += @{ Status = 'Failed'; Message = 'Failed to Enable Network Discovery.'; Error = $_.Exception.Message }
-		}
+		# Never disable an existing rule: earlier versions or administrators may rely on it.
+		Write-Verbose 'Network Discovery left unchanged because the option was not selected.'
+		$results += @{ Status = 'Skipped'; Message = 'Network Discovery left unchanged (optional; not required for SMB scanning).'; Error = $null }
 	}
 	return $results
 }
@@ -1396,6 +1408,8 @@ $($script:themeResources)
         <CheckBox Name="chkSetShare" Content="Set SMB share" Margin="0,0,0,6"/>
         <CheckBox Name="chkCreateShortcut" Content="Create desktop shortcut" Margin="0,0,0,6"/>
         <CheckBox Name="chkNetworkSettings" Content="Check network settings" Margin="0,0,0,6"/>
+        <CheckBox Name="chkNetworkDiscovery" Content="Also enable Network Discovery" Margin="20,0,0,6"
+                  ToolTip="Optional. Only needed when the printer browses the network to find this PC. Typed paths such as \\PC\scans work without it."/>
         <Button Name="btnOK" Content="OK" Width="75" Height="24" HorizontalAlignment="Right" Margin="0,12,0,0"/>
     </StackPanel>
 </Window>
@@ -1412,7 +1426,12 @@ $($script:themeResources)
 	$window.FindName('chkSetShare').IsChecked = $script:setShare
 	$window.FindName('chkCreateShortcut').IsChecked = $script:createShortcut
 	$window.FindName('chkNetworkSettings').IsChecked = $script:checkNetworkSettings
-
+	$discoveryBox = $window.FindName('chkNetworkDiscovery')
+	$discoveryBox.IsChecked = $script:enableNetworkDiscovery
+	# Discovery is part of the network step, so it is unavailable when that step is off.
+	$discoveryBox.IsEnabled = [bool]$script:checkNetworkSettings
+	$window.FindName('chkNetworkSettings').Add_Checked({ $discoveryBox.IsEnabled = $true })
+	$window.FindName('chkNetworkSettings').Add_Unchecked({ $discoveryBox.IsEnabled = $false })
 	$window.FindName('btnOK').Add_Click({
 		$script:createUser = [bool]$window.FindName('chkCreateUser').IsChecked
 		$script:hideUser = [bool]$window.FindName('chkHideUser').IsChecked
@@ -1421,6 +1440,7 @@ $($script:themeResources)
 		$script:setShare = [bool]$window.FindName('chkSetShare').IsChecked
 		$script:createShortcut = [bool]$window.FindName('chkCreateShortcut').IsChecked
 		$script:checkNetworkSettings = [bool]$window.FindName('chkNetworkSettings').IsChecked
+		$script:enableNetworkDiscovery = $script:checkNetworkSettings -and [bool]$window.FindName('chkNetworkDiscovery').IsChecked
 		$window.DialogResult = $true
 	})
 
@@ -1728,7 +1748,7 @@ else {
 	}
 
 	if ($checkNetworkSettings -eq $true) {
-		$netResults = Set-NetworkConfiguration -DomainJoined $domainJoined
+		$netResults = Set-NetworkConfiguration -DomainJoined $domainJoined -EnableDiscovery $enableNetworkDiscovery
 		foreach ($r in $netResults) { Show-StepResult $r }
 	}
 

@@ -307,6 +307,7 @@ Describe 'Account-dependent setup steps' {
 		$script:setShare = $true
 		$script:createShortcut = $true
 		$script:checkNetworkSettings = $true
+		$script:enableNetworkDiscovery = $false
 		$script:hasCimInstance = $true
 		$script:hasErrors = $false
 		$script:progressMax = 10
@@ -325,6 +326,15 @@ Describe 'Account-dependent setup steps' {
 		Mock Initialize-ScanShare { }
 		Mock Initialize-DesktopShortcut { }
 		Mock Set-NetworkConfiguration { }
+	}
+
+	It 'passes the Network Discovery opt-in to network setup' {
+		$script:testUserResults = @{ Status = 'Success'; Message = 'ok'; Error = $null }
+		. $script:runSteps
+		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It -ParameterFilter { -not $EnableDiscovery }
+		$script:enableNetworkDiscovery = $true
+		. $script:runSteps
+		Assert-MockCalled Set-NetworkConfiguration -Times 1 -Exactly -Scope It -ParameterFilter { $EnableDiscovery }
 	}
 
 	It 'skips permissions and shares and disables copying after account failure' {
@@ -1137,17 +1147,35 @@ Describe 'Network setup' {
 		Mock netsh { $global:LASTEXITCODE = 0 }
 	}
 
-	It 'sets a public non-domain profile to private and enables both firewall groups' {
+	It 'sets a public non-domain profile to private and enables only File and Printer Sharing by default' {
 		Mock Get-NetConnectionProfile { [pscustomobject]@{ NetworkCategory = 'Public' } }
 		$results = @(Set-NetworkConfiguration -DomainJoined $false)
 		@($results | Where-Object { $_.Status -eq 'Failed' }).Count | Should Be 0
 		Assert-MockCalled Set-NetConnectionProfile -Times 1 -Exactly -Scope It -ParameterFilter { $NetworkCategory -eq 'Private' }
-		Assert-MockCalled Set-NetFirewallRule -Times 2 -Exactly -Scope It
+		Assert-MockCalled Set-NetFirewallRule -Times 1 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'File and Printer Sharing' }
+		Assert-MockCalled Set-NetFirewallRule -Times 0 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'Network Discovery' }
+		$skipped = @($results | Where-Object { $_.Status -eq 'Skipped' })
+		$skipped.Count | Should Be 1
+		$skipped[0].Message | Should Match 'Network Discovery left unchanged'
+	}
+
+	It 'enables Network Discovery only when opted in' {
+		$results = @(Set-NetworkConfiguration -DomainJoined $false -EnableDiscovery $true)
+		@($results | Where-Object { $_.Status -eq 'Skipped' }).Count | Should Be 0
+		Assert-MockCalled Set-NetFirewallRule -Times 1 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'File and Printer Sharing' -and $Profile -eq 'Private' }
+		Assert-MockCalled Set-NetFirewallRule -Times 1 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'Network Discovery' -and $Profile -eq 'Private' }
+		@($results | Where-Object { $_.Message -match 'Network Discovery has been enabled \(Private profile\)' }).Count | Should Be 1
+	}
+
+	It 'never touches the Network Discovery group when not opted in' {
+		Set-NetworkConfiguration -DomainJoined $false | Out-Null
+		Assert-MockCalled Get-NetFirewallRule -Times 0 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'Network Discovery' }
+		Assert-MockCalled Set-NetFirewallRule -Times 0 -Exactly -Scope It -ParameterFilter { $DisplayGroup -eq 'Network Discovery' }
 	}
 
 	It 'does not change a domain profile and maps DomainAuthenticated to Domain' {
 		Mock Get-NetConnectionProfile { [pscustomobject]@{ NetworkCategory = 'DomainAuthenticated' } }
-		$results = @(Set-NetworkConfiguration -DomainJoined $true)
+		$results = @(Set-NetworkConfiguration -DomainJoined $true -EnableDiscovery $true)
 		$results[0].Status | Should Be 'Skipped'
 		Assert-MockCalled Set-NetConnectionProfile -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetFirewallRule -Times 2 -Exactly -Scope It -ParameterFilter { $Profile -eq 'Domain' }
@@ -1155,30 +1183,38 @@ Describe 'Network setup' {
 
 	It 'leaves already enabled private networking unchanged' {
 		Mock Get-NetFirewallRule { [pscustomobject]@{ Enabled = 'True'; Profile = 'Private' } }
-		Set-NetworkConfiguration -DomainJoined $false | Out-Null
+		$results = @(Set-NetworkConfiguration -DomainJoined $false -EnableDiscovery $true)
 		Assert-MockCalled Set-NetConnectionProfile -Times 0 -Exactly -Scope It
 		Assert-MockCalled Set-NetFirewallRule -Times 0 -Exactly -Scope It
+		@($results | Where-Object { $_.Message -match 'already enabled' }).Count | Should Be 2
 	}
 
 	It 'reports non-terminating firewall failures' {
 		Mock Set-NetFirewallRule { Write-Error 'Access is denied' }
-		$results = @(Set-NetworkConfiguration -DomainJoined $false)
+		$results = @(Set-NetworkConfiguration -DomainJoined $false -EnableDiscovery $true)
 		@($results | Where-Object { $_.Status -eq 'Failed' }).Count | Should Be 2
 	}
 
 	It 'runs the legacy firewall path and respects domain management' {
 		$script:hasNetConnection = $false
 		$script:hasNetSecurity = $false
-		$results = @(Set-NetworkConfiguration -DomainJoined $true)
+		$results = @(Set-NetworkConfiguration -DomainJoined $true -EnableDiscovery $true)
 		$results[0].Status | Should Be 'Skipped'
 		Assert-MockCalled netsh -Times 2 -Exactly -Scope It
+	}
+
+	It 'runs only the File and Printer Sharing legacy command by default' {
+		$script:hasNetConnection = $false
+		$script:hasNetSecurity = $false
+		Set-NetworkConfiguration -DomainJoined $true | Out-Null
+		Assert-MockCalled netsh -Times 1 -Exactly -Scope It
 	}
 
 	It 'reports every failed legacy firewall command rather than claiming success' {
 		$script:hasNetConnection = $false
 		$script:hasNetSecurity = $false
 		Mock netsh { $global:LASTEXITCODE = 1; 'Access is denied' }
-		$results = @(Set-NetworkConfiguration -DomainJoined $false)
+		$results = @(Set-NetworkConfiguration -DomainJoined $false -EnableDiscovery $true)
 		@($results | Where-Object { $_.Status -eq 'Failed' }).Count | Should Be 3
 	}
 }
