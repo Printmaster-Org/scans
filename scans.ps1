@@ -37,7 +37,7 @@ function Invoke-ScanRelease {
 		if ($actualHash -ine $release.sha256) {
 			throw "SHA-256 verification failed for $($release.version). Nothing was executed. Try again or contact the maintainer."
 		}
-		Start-ScanScript -Path $downloadPath -ReleaseVersion $release.version
+		Start-ScanScript -Path $downloadPath -Sha256 $release.sha256 -ReleaseVersion $release.version | Out-Null
 	}
 	finally {
 		if (Test-Path -LiteralPath $downloadPath) { Remove-Item -LiteralPath $downloadPath -Force -ErrorAction Stop }
@@ -45,17 +45,94 @@ function Invoke-ScanRelease {
 	}
 }
 
-function Start-ScanScript {
-	param([string]$Path, [string]$ReleaseVersion)
-	# The child inherits elevation; waiting keeps the verified file available until setup exits.
+function New-ScanLaunchCommand {
+	<#
+	.SYNOPSIS
+	Builds the child PowerShell command that re-verifies and runs the downloaded utility.
+	.DESCRIPTION
+	The child reads the file once, hashes those exact bytes, and executes the same
+	in-memory text. Nothing re-reads the file after the check, so swapping it in %TEMP%
+	between the loader's verification and UAC approval cannot inject elevated code.
+	Running from memory also avoids depending on the machine's execution policy.
+	#>
+	param([string]$Path, [string]$Sha256, [switch]$Elevated)
+	$verifyFailedExitCode = Get-ScanVerifyFailedExitCode
+	$quotedPath = "'" + $Path.Replace("'", "''") + "'"
+	$elevatedArgument = if ($Elevated) { ' -Elevated' } else { '' }
+	$command = @"
+`$ErrorActionPreference = 'Stop'
+try {
+	`$bytes = [IO.File]::ReadAllBytes($quotedPath)
+	`$sha = [Security.Cryptography.SHA256]::Create()
+	`$hash = [BitConverter]::ToString(`$sha.ComputeHash(`$bytes)).Replace('-', '')
+	if (`$hash -ine '$Sha256') { [Console]::Error.WriteLine('Scans SHA-256 re-check failed; nothing was executed.'); exit $verifyFailedExitCode }
+	`$text = [Text.UTF8Encoding]::new(`$false).GetString(`$bytes).TrimStart([char]0xFEFF)
+	& ([scriptblock]::Create(`$text))$elevatedArgument
+	exit 0
+}
+catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }
+"@
+	return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+}
+
+function Get-ScanVerifyFailedExitCode {
+	# Reserved for the child's in-memory SHA-256 re-check; the utility itself exits 0 or 1.
+	return 86
+}
+
+function Test-ScanAdministrator {
 	$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-	if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-		throw 'Open PowerShell or Terminal as Administrator, then run the Scans command again.'
+	return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-ScanUacCanceled {
+	param([Exception]$Exception)
+	for ($e = $Exception; $e; $e = $e.InnerException) {
+		# 1223 is Win32 ERROR_CANCELLED: the user declined the UAC consent prompt.
+		if ($e -is [ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1223) { return $true }
 	}
-	Write-Host "Starting PrintMaster Scans $ReleaseVersion (SHA-256 verified)."
-	$hostExecutable = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' }
-	& (Join-Path $PSHOME $hostExecutable) -NoProfile -STA -File $Path
-	if ($LASTEXITCODE -ne 0) { throw "Scans exited with code $LASTEXITCODE. Review the setup errors before trying again." }
+	return $false
+}
+
+function Start-ScanScript {
+	<#
+	.SYNOPSIS
+	Runs the verified utility, requesting UAC elevation when the session is not elevated.
+	.OUTPUTS
+	$true when setup ran, $false when the user canceled the UAC prompt.
+	#>
+	param([string]$Path, [string]$Sha256, [string]$ReleaseVersion)
+	$hostExecutable = Join-Path $PSHOME $(if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' })
+
+	if (Test-ScanAdministrator) {
+		Write-Host "Starting PrintMaster Scans $ReleaseVersion (SHA-256 verified)."
+		$encoded = New-ScanLaunchCommand -Path $Path -Sha256 $Sha256
+		& $hostExecutable -NoProfile -STA -EncodedCommand $encoded
+		$exitCode = $LASTEXITCODE
+	}
+	else {
+		Write-Host "Requesting administrator approval to run PrintMaster Scans $ReleaseVersion (SHA-256 verified)."
+		$encoded = New-ScanLaunchCommand -Path $Path -Sha256 $Sha256 -Elevated
+		try {
+			# -Wait keeps the verified temp file in place until the elevated child exits.
+			$process = Start-Process -FilePath $hostExecutable -ArgumentList @('-NoProfile', '-STA', '-EncodedCommand', $encoded) `
+				-Verb RunAs -Wait -PassThru -ErrorAction Stop
+		}
+		catch {
+			if (Test-ScanUacCanceled $_.Exception) {
+				Write-Host 'Administrator approval was declined. Scans did not run and nothing was changed.'
+				return $false
+			}
+			throw
+		}
+		$exitCode = $process.ExitCode
+	}
+
+	if ($exitCode -eq (Get-ScanVerifyFailedExitCode)) {
+		throw 'The downloaded file changed after verification, so it was not executed. Run the Scans command again.'
+	}
+	if ($exitCode -ne 0) { throw "Scans exited with code $exitCode. Review the setup errors before trying again." }
+	return $true
 }
 
 try {

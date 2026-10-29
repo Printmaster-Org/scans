@@ -100,8 +100,20 @@ Describe 'Verified loader execution' {
 
 	It 'executes only a verified download and removes its temporary file and directory' {
 		Invoke-ScanRelease
-		Assert-MockCalled Start-ScanScript -Times 1 -Exactly -Scope It -ParameterFilter { $ReleaseVersion -eq 'v2.1.0' }
+		Assert-MockCalled Start-ScanScript -Times 1 -Exactly -Scope It -ParameterFilter { $ReleaseVersion -eq 'v2.1.0' -and $Sha256 -eq $script:release.sha256 }
 		Test-Path -LiteralPath $script:downloadPath | Should Be $false
+		Test-Path -LiteralPath (Split-Path $script:downloadPath -Parent) | Should Be $false
+	}
+
+	It 'cleans up the verified download when the user declines UAC' {
+		Mock Start-ScanScript { $false }
+		{ Invoke-ScanRelease } | Should Not Throw
+		Test-Path -LiteralPath (Split-Path $script:downloadPath -Parent) | Should Be $false
+	}
+
+	It 'cleans up the verified download when setup fails' {
+		Mock Start-ScanScript { throw 'Scans exited with code 1.' }
+		{ Invoke-ScanRelease } | Should Throw 'exited with code 1'
 		Test-Path -LiteralPath (Split-Path $script:downloadPath -Parent) | Should Be $false
 	}
 
@@ -123,6 +135,87 @@ Describe 'Verified loader execution' {
 		{ Invoke-ScanRelease } | Should Throw 'Manifest unavailable'
 		Assert-MockCalled Invoke-WebRequest -Times 0 -Exactly -Scope It
 		Assert-MockCalled Start-ScanScript -Times 0 -Exactly -Scope It
+	}
+}
+
+Describe 'Loader elevation' {
+	BeforeEach {
+		$script:payload = Join-Path $TestDrive 'utility.ps1'
+		$script:marker = Join-Path $TestDrive 'marker.txt'
+		Remove-Item -LiteralPath $script:marker -ErrorAction SilentlyContinue
+		# Fixture utility: records whether it ran and with -Elevated, then exits with a chosen code.
+		$script:writePayload = {
+			param([int]$ExitCode = 0)
+			$markerLiteral = "'" + $script:marker.Replace("'", "''") + "'"
+			[IO.File]::WriteAllText($script:payload, "param([switch]`$Elevated)`n[IO.File]::WriteAllText($markerLiteral, ('ran elevated=' + [bool]`$Elevated))`nexit $ExitCode`n", [Text.UTF8Encoding]::new($true))
+			(Get-FileHash -LiteralPath $script:payload -Algorithm SHA256).Hash
+		}
+		$script:hostExe = Join-Path $PSHOME $(if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' })
+		Mock Write-Host { }
+	}
+
+	It 'runs the verified bytes in a real child and passes -Elevated only when requested' {
+		$hash = & $script:writePayload 0
+		& $script:hostExe -NoProfile -NonInteractive -EncodedCommand (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash -Elevated)
+		$LASTEXITCODE | Should Be 0
+		Get-Content -LiteralPath $script:marker | Should Be 'ran elevated=True'
+		& $script:hostExe -NoProfile -NonInteractive -EncodedCommand (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash)
+		Get-Content -LiteralPath $script:marker | Should Be 'ran elevated=False'
+	}
+
+	It 'propagates the utility exit code from the child' {
+		$hash = & $script:writePayload 1
+		& $script:hostExe -NoProfile -NonInteractive -EncodedCommand (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash)
+		$LASTEXITCODE | Should Be 1
+	}
+
+	It 'refuses to run a file that changed after the loader verified it' {
+		$hash = & $script:writePayload 0
+		Add-Content -LiteralPath $script:payload -Value '# tampered'
+		& $script:hostExe -NoProfile -NonInteractive -EncodedCommand (New-ScanLaunchCommand -Path $script:payload -Sha256 $hash) 2>$null
+		$LASTEXITCODE | Should Be (Get-ScanVerifyFailedExitCode)
+		Test-Path -LiteralPath $script:marker | Should Be $false
+	}
+
+	It 'requests UAC with a waiting, re-verifying elevated child when not elevated' {
+		Mock Test-ScanAdministrator { $false }
+		Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+		Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' | Should Be $true
+		Assert-MockCalled Start-Process -Times 1 -Exactly -Scope It -ParameterFilter {
+			$command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))
+			$Verb -eq 'RunAs' -and $Wait -and $PassThru -and $ArgumentList -contains '-EncodedCommand' -and
+				$command.Contains("'C:\temp\scans.ps1'") -and $command.Contains('a' * 64) -and $command.Contains(' -Elevated')
+		}
+	}
+
+	It 'treats a declined UAC prompt as a normal cancellation' {
+		Mock Test-ScanAdministrator { $false }
+		Mock Start-Process { throw [InvalidOperationException]::new('canceled', [ComponentModel.Win32Exception]::new(1223)) }
+		Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' | Should Be $false
+		Assert-MockCalled Write-Host -Scope It -ParameterFilter { "$Object" -match 'declined' }
+	}
+
+	It 'rethrows other elevation failures' {
+		Mock Test-ScanAdministrator { $false }
+		Mock Start-Process { throw [ComponentModel.Win32Exception]::new(2) }
+		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw
+	}
+
+	It 'reports elevated child failures and post-verification tampering distinctly' {
+		Mock Test-ScanAdministrator { $false }
+		Mock Start-Process { [pscustomobject]@{ ExitCode = 1 } }
+		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw 'exited with code 1'
+		Mock Start-Process { [pscustomobject]@{ ExitCode = (Get-ScanVerifyFailedExitCode) } }
+		{ Start-ScanScript -Path 'C:\temp\scans.ps1' -Sha256 ('a' * 64) -ReleaseVersion 'v2.3.0' } | Should Throw 'changed after verification'
+	}
+
+	It 'runs directly without UAC when already elevated' {
+		Mock Test-ScanAdministrator { $true }
+		Mock Start-Process { throw 'UAC must not be requested' }
+		$hash = & $script:writePayload 0
+		Start-ScanScript -Path $script:payload -Sha256 $hash -ReleaseVersion 'v2.3.0' | Should Be $true
+		Get-Content -LiteralPath $script:marker | Should Be 'ran elevated=False'
+		Assert-MockCalled Start-Process -Times 0 -Exactly -Scope It
 	}
 }
 
