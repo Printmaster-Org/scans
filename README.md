@@ -181,7 +181,7 @@ Direct, fast-forward pushes to `main` are permitted; feature branches and pull r
 
 External actions are pinned to full commit SHAs. [Dependabot](.github/dependabot.yml) checks GitHub Actions dependencies weekly and opens update PRs.
 
-`main` does not require branch protection or pre-merge status checks. Post-push CI detects failures but does not prevent a push or merge. Release preparation and Pages promotion still require successful main-push CI for the selected source commits. Utility changes reach users only through a manually published release; the raw-main loader itself still changes immediately when pushed.
+`main` does not require pull requests or pre-merge status checks; a repository ruleset only blocks force-pushes and branch deletion. Secret scanning push protection rejects pushes containing detected credentials. Post-push CI detects failures but does not prevent a push or merge. Release preparation and Pages promotion still require successful main-push CI for the selected source commits. Utility changes reach users only through a manually published release; the raw-main loader itself still changes immediately when pushed.
 
 ### Running tests locally
 
